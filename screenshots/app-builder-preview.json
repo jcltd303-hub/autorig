@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Marionette",
+      "hasCanvas": false,
+      "bodyTextLen": 544,
+      "bodyTextHash": "36895438edddd9982cc7fe3cae19f121a1ff114c0debc2f97a91f29185091c67",
+      "bodyTextPrefix": "Marionette Cut any picture into a stringed figure. I Figure II B",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Marionette",
+      "hasCanvas": false,
+      "bodyTextLen": 504,
+      "bodyTextHash": "7546b9e153c92280c334d4661a60f153246438e86ebafd0cb72d807b235f6c24",
+      "bodyTextPrefix": "Marionette I Figure II Bones III Parts IV Motion V Archive WORKS",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

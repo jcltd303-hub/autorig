@@ -1,0 +1,15 @@
+import { a as init_fetch_blob, r as init_file, t as init_from } from "./fetch-blob+[...].mjs";
+import { r as init_esm_min } from "./formdata-polyfill.mjs";
+import { c as init_request, d as init_is_redirect, g as init_fetch_error, i as init_src, m as init_headers, o as init_abort_error, r as fetch, u as init_response } from "./node-fetch.mjs";
+init_fetch_blob();
+init_file();
+init_esm_min();
+init_fetch_error();
+init_headers();
+init_is_redirect();
+init_response();
+init_request();
+init_abort_error();
+init_from();
+init_src();
+export { fetch as default };
