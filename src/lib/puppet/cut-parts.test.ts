@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildCutSegments, buildGeodesicOwnership, buildConstrainedOwnership } from "./cut-parts";
+import { applyMaskEdits, buildCutSegments, buildGeodesicOwnership, buildConstrainedOwnership } from "./cut-parts";
 import { buildFigureMask, detectBackground } from "./image";
 const g = globalThis as typeof globalThis & { ImageData?: any };
 
@@ -150,4 +150,20 @@ test("background-colored artwork inside a solid background is preserved", () => 
   const image = new ImageData(data, width, height);
   const mask = buildFigureMask(image, { r: 30, g: 30, b: 30, threshold: 1, lift: false });
   assert.equal(mask[center / 4], 1);
+});
+
+test("attachment mask edits can add and erase localized repair strokes", () => {
+  const width = 9;
+  const height = 9;
+  const alpha = new Uint8Array(width * height);
+  alpha[4 * width + 4] = 255;
+
+  const repaired = applyMaskEdits(alpha, width, height, [
+    { x: 6, y: 4, radius: 1.5, mode: "add" },
+    { x: 4, y: 4, radius: 1, mode: "erase" },
+  ]);
+
+  assert.equal(repaired[4 * width + 4], 0);
+  assert.equal(repaired[4 * width + 6], 255);
+  assert.equal(repaired[4 * width + 5], 255);
 });
