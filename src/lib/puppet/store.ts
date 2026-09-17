@@ -127,7 +127,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   setStep: (step) => {
     set({ step, error: null });
     if (step === "parts" && get().source && get().joints.length) {
-      if (!get().attachments.length || get().attachmentsNeedReview) {
+      if (!get().attachments.length && !get().busy) {
         void get().cutPaper();
       }
     }
@@ -194,6 +194,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         .joints.filter((j) => j.id !== id)
         .map((j) => (j.parentId === id ? { ...j, parentId: null } : j)),
       selectedId: selectedId === id ? null : selectedId,
+      attachments: attachments.filter((attachment) => attachment.boneId !== id),
       jointVersion: jointVersion + 1,
       attachmentsNeedReview: attachments.length > 0,
     });
@@ -317,7 +318,6 @@ export const useStudio = create<StudioState>((set, get) => ({
         joints, 
         selectedId: joints[0]?.id ?? null, 
         jointVersion: get().jointVersion + 1,
-        attachments: [],
         attachmentsNeedReview: true,
         bg: key,
         busy: null,
@@ -388,6 +388,7 @@ export const useStudio = create<StudioState>((set, get) => ({
     });
   },
   cutPaper: async () => {
+    const draftVersion = get().jointVersion;
     const { source, joints, bg } = get();
     if (!source || !joints.length) return;
     set({ busy: "Cutting paper into parts...", error: null });
@@ -411,8 +412,8 @@ export const useStudio = create<StudioState>((set, get) => ({
         : [presetAnimation("idle", joints), presetAnimation("walk", joints)];
       set({
         attachments: parts,
-        attachmentsNeedReview: false,
-        partDraftVersion: get().jointVersion,
+        attachmentsNeedReview: get().jointVersion !== draftVersion,
+        partDraftVersion: draftVersion,
         busy: null,
         animations,
         activeAnimId: get().activeAnimId ?? animations[0]?.id ?? null,
