@@ -64,33 +64,50 @@ function colorDist(r1: number, g1: number, b1: number, r2: number, g2: number, b
   return Math.sqrt(dr * dr + dg * dg + db * db);
 }
 
+function percentile(values: number[], p: number) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((sorted.length - 1) * p)));
+  return sorted[index] ?? 0;
+}
+
 export function detectBackground(image: ImageData): BackgroundKey {
   const { width, height, data } = image;
-  const pts: Array<[number, number]> = [
-    [2, 2], [width - 3, 2], [2, height - 3], [width - 3, height - 3],
-    [Math.floor(width / 2), 2], [Math.floor(width / 2), height - 3],
-    [2, Math.floor(height / 2)], [width - 3, Math.floor(height / 2)],
-    [Math.floor(width * 0.25), 2], [Math.floor(width * 0.75), 2],
-  ];
+  const strip = Math.max(2, Math.min(4, Math.floor(Math.min(width, height) / 16) || 2));
   const samples: number[][] = [];
   let hasTransparentSample = false;
-  for (const [x, y] of pts) {
+  const addSample = (x: number, y: number) => {
     const i = (y * width + x) * 4;
     const alpha = data[i + 3] ?? 0;
     hasTransparentSample ||= alpha < 12;
     samples.push([data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0]);
+  };
+  const xStep = Math.max(1, Math.floor(width / 128));
+  const yStep = Math.max(1, Math.floor(height / 128));
+  for (let y = 0; y < Math.min(strip, height); y++) {
+    for (let x = 0; x < width; x += xStep) addSample(x, y);
+  }
+  for (let y = Math.max(strip, height - strip); y < height; y++) {
+    for (let x = 0; x < width; x += xStep) addSample(x, y);
+  }
+  for (let x = 0; x < Math.min(strip, width); x++) {
+    for (let y = strip; y < height - strip; y += yStep) addSample(x, y);
+  }
+  for (let x = Math.max(strip, width - strip); x < width; x++) {
+    for (let y = strip; y < height - strip; y += yStep) addSample(x, y);
   }
   if (hasTransparentSample) return { r: 0, g: 0, b: 0, threshold: 0, lift: false };
   const med = [0, 1, 2].map((c) => {
     const v = samples.map((s) => s[c] ?? 0).sort((a, b) => a - b);
     return v[Math.floor(v.length / 2)] ?? 0;
   });
-  let maxDist = 0;
-  for (const s of samples) maxDist = Math.max(maxDist, colorDist(s[0] ?? 0, s[1] ?? 0, s[2] ?? 0, med[0], med[1], med[2]));
-  const threshold = Math.max(30, maxDist + 20);
+  const distances = samples.map((s) => colorDist(s[0] ?? 0, s[1] ?? 0, s[2] ?? 0, med[0], med[1], med[2]));
+  const spread = percentile(distances, 0.9);
+  const threshold = Math.max(18, Math.min(52, spread + 10));
+  const support = distances.filter((distance) => distance <= threshold).length / Math.max(1, distances.length);
   const maskCount = countFigurePixels(image, { r: med[0], g: med[1], b: med[2], threshold, lift: true });
   const ratio = maskCount / (width * height);
-  return { r: med[0], g: med[1], b: med[2], threshold, lift: ratio > 0.04 && ratio < 0.88 };
+  return { r: med[0], g: med[1], b: med[2], threshold, lift: support >= 0.8 && spread <= 42 && ratio > 0.04 && ratio < 0.92 };
 }
 
 export function isBackground(image: ImageData, x: number, y: number, bg: BackgroundKey) {
