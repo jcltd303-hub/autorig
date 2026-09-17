@@ -31,21 +31,30 @@ function centroid(
   return { x: sx / n, y: sy / n };
 }
 
-function extremum(
+function regionEndpoint(
   mask: Uint8Array,
   width: number,
   height: number,
-  score: (x: number, y: number) => number,
+  bbox: { x: number; y: number; w: number; h: number },
+  region: "hand" | "foot",
+  side: "left" | "right",
 ) {
+  const centerX = bbox.x + bbox.w * 0.5;
+  const minX = side === "left" ? bbox.x : centerX;
+  const maxX = side === "left" ? centerX : bbox.x + bbox.w;
+  const minY = region === "hand" ? bbox.y + bbox.h * 0.28 : bbox.y + bbox.h * 0.62;
+  const maxY = region === "hand" ? bbox.y + bbox.h * 0.72 : bbox.y + bbox.h;
   let best = -Infinity;
-  let px = width / 2;
-  let py = height / 2;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
+  let px = side === "left" ? minX : maxX;
+  let py = region === "hand" ? (minY + maxY) / 2 : maxY;
+  for (let y = Math.max(0, Math.floor(minY)); y < Math.min(height, Math.ceil(maxY)); y++) {
+    for (let x = Math.max(0, Math.floor(minX)); x < Math.min(width, Math.ceil(maxX)); x++) {
       if (!mask[y * width + x]) continue;
-      const s = score(x, y);
-      if (s > best) {
-        best = s;
+      const lateral = side === "left" ? centerX - x : x - centerX;
+      const vertical = region === "foot" ? y - minY : Math.abs(y - (minY + maxY) / 2);
+      const score = lateral * 2 - vertical * 0.35;
+      if (score > best) {
+        best = score;
         px = x;
         py = y;
       }
@@ -116,10 +125,10 @@ export function placeFromSilhouette(
         x <= bbox.x + bbox.w * 0.7,
     ) ?? { x: bbox.x + bbox.w * 0.5, y: bbox.y + bbox.h * 0.52 };
   const torso = lerp(head, hips, 0.45);
-  const handL = extremum(mask, width, height, (x, y) => -x - y * 0.15);
-  const handR = extremum(mask, width, height, (x, y) => x - y * 0.15);
-  const footL = extremum(mask, width, height, (x, y) => y - x * 0.35);
-  const footR = extremum(mask, width, height, (x, y) => y + x * 0.35);
+  const handL = regionEndpoint(mask, width, height, bbox, "hand", "left");
+  const handR = regionEndpoint(mask, width, height, bbox, "hand", "right");
+  const footL = regionEndpoint(mask, width, height, bbox, "foot", "left");
+  const footR = regionEndpoint(mask, width, height, bbox, "foot", "right");
   const shoulderL = {
     x: torso.x - bbox.w * 0.16,
     y: torso.y + bbox.h * 0.02,
@@ -172,7 +181,7 @@ function refineThickness(joints: Joint[], mask: Uint8Array, width: number, heigh
     const parent = joint.parentId ? map.get(joint.parentId) : null;
     if (!parent) continue;
     const w = localWidth(mask, width, height, parent.x, parent.y, joint.x, joint.y);
-    joint.thickness = Math.max(6, Math.min(joint.thickness * 1.6, w * 1.05));
+    joint.thickness = Math.max(6, Math.min(joint.thickness * 1.25, w * 1.05, width));
   }
 }
 
