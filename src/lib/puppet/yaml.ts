@@ -54,6 +54,7 @@ export function buildRigDocument(
 ) {
   const rest: Record<string, number> = {};
   for (const joint of joints) rest[joint.id] = 0;
+  const jointsById = new Map(joints.map((joint) => [joint.id, joint]));
 
   return {
     version: 2,
@@ -70,18 +71,25 @@ export function buildRigDocument(
       source: "source.jpg",
       canvas: { width: source.width, height: source.height },
     },
-    attachments: attachments.map((attachment) => ({
-      id: attachment.id,
-      bone: attachment.boneId,
-      label: attachment.label,
-      role: attachment.role,
-      file: `parts/${attachment.id}.png`,
-      mask: attachment.mask ? `masks/${attachment.id}.png` : undefined,
-      crop: { x: Math.round(attachment.cropX), y: Math.round(attachment.cropY), width: attachment.width, height: attachment.height },
-      local_pivot: { x: round(attachment.localPivotX), y: round(attachment.localPivotY) },
-      z_offset: attachment.zIndex,
-      visible: attachment.visible ?? true,
-    })),
+    attachments: attachments.map((attachment) => {
+      const bone = jointsById.get(attachment.boneId);
+      if (!bone) throw new Error(`Attachment ${attachment.id} references missing bone ${attachment.boneId}`);
+      return {
+        id: attachment.id,
+        bone: attachment.boneId,
+        label: attachment.label,
+        role: attachment.role,
+        file: `parts/${attachment.id}.png`,
+        mask: attachment.mask ? `masks/${attachment.id}.png` : undefined,
+        crop: { x: Math.round(attachment.cropX), y: Math.round(attachment.cropY), width: attachment.width, height: attachment.height },
+        local_pivot: {
+          x: round(bone.x - attachment.cropX),
+          y: round(bone.y - attachment.cropY),
+        },
+        z_offset: attachment.zIndex,
+        visible: attachment.visible ?? true,
+      };
+    }),
     bones: joints.map((joint) => ({
       id: joint.id,
       label: joint.label,
@@ -131,6 +139,7 @@ export function archiveReadme(name: string) {
 
 source.jpg          original figure
 parts/*.png         transparent overlapping layers, one per bone
+masks/*.png         explicit per-part alpha masks when present
 marionette.yaml     rotation points, stop ranges, poses, animation tracks
 
 How to draw
