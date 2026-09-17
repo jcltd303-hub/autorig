@@ -196,7 +196,9 @@ export function buildConstrainedOwnership(
       const projection = segmentProjection(x, y, segment.ax, segment.ay, segment.bx, segment.by);
       const isRoot = partIndex === rootOwner;
       const proximalLimit = segment.leaf === true ? -0.3 : isRoot ? -0.15 : 0.12;
-      const distalLimit = segment.leaf === true ? 1.7 : 1.25;
+      // Keep a generous directional corridor so irregular artwork can extend
+      // beyond the nominal bone endpoint without being dropped from the part.
+      const distalLimit = 1.7;
       if (projection < proximalLimit || projection > distalLimit) continue;
 
       const distance = Math.sqrt(pointSegmentDistanceSquared(x, y, segment.ax, segment.ay, segment.bx, segment.by));
