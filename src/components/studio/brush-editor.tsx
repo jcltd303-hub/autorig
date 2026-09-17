@@ -13,31 +13,49 @@ export function BrushEditor() {
   const attachment = attachments.find(a => a.id === brush.attachmentId);
 
   useEffect(() => {
-    if (!attachment) return;
-    setHistory([attachment.mask]);
-    setHistoryIndex(0);
-  }, [attachment?.id, attachment]);
+    if (!attachment || attachment.mask.pixelMask) return;
+    
+    // Load pixel mask from DataURL
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = attachment.mask.alphaPngDataUrl;
+    img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, img.width, img.height);
+        const mask = new Uint8Array(img.width * img.height);
+        for (let i = 0; i < mask.length; i++) {
+            mask[i] = imageData.data[i * 4 + 3];
+        }
+        updateAttachmentMask(attachment.id, { ...attachment.mask, pixelMask: mask });
+    };
+  }, [attachment, updateAttachmentMask]);
 
   useEffect(() => {
-    if (!canvasRef.current || !attachment) return;
+    if (!canvasRef.current || !attachment || !attachment.mask.pixelMask) return;
     const ctx = canvasRef.current.getContext('2d');
     if (!ctx) return;
-
+    
     // Draw the mask
     const imgData = new ImageData(
-      new Uint8ClampedArray(attachment.mask.length * 4).map((_, i) => {
+      new Uint8ClampedArray(attachment.mask.pixelMask.length * 4).map((_, i) => {
         const pixelIdx = Math.floor(i / 4);
-        const alpha = attachment.mask[pixelIdx] || 0;
-        return (i + 1) % 4 === 0 ? alpha : 255; // White artwork + mask alpha
+        const alpha = attachment.mask.pixelMask![pixelIdx] || 0;
+        return (i + 1) % 4 === 0 ? alpha : 255;
       }),
-      attachment.bounds.width,
-      attachment.bounds.height
+      attachment.mask.width,
+      attachment.mask.height
     );
     ctx.putImageData(imgData, 0, 0);
-  }, [attachment?.id, attachment]); // Include attachment to satisfy exhaustive-deps
+  }, [attachment]);
 
   const commitEdit = (newMask: Uint8Array) => {
-    updateAttachmentMask(attachment!.id, newMask);
+    if (!attachment) return;
+    updateAttachmentMask(attachment.id, { ...attachment.mask, pixelMask: newMask });
     const newHistory = history.slice(0, historyIndex + 1);
     newHistory.push(newMask);
     setHistory(newHistory);
@@ -45,21 +63,21 @@ export function BrushEditor() {
   };
 
   const undo = () => {
-    if (historyIndex > 0) {
-        setHistoryIndex(historyIndex - 1);
-        updateAttachmentMask(attachment!.id, history[historyIndex - 1]);
-    }
+    if (!attachment || historyIndex <= 0) return;
+    const newIndex = historyIndex - 1;
+    setHistoryIndex(newIndex);
+    updateAttachmentMask(attachment.id, { ...attachment.mask, pixelMask: history[newIndex] });
   };
 
   const redo = () => {
-    if (historyIndex < history.length - 1) {
-        setHistoryIndex(historyIndex + 1);
-        updateAttachmentMask(attachment!.id, history[historyIndex + 1]);
-    }
+    if (!attachment || historyIndex >= history.length - 1) return;
+    const newIndex = historyIndex + 1;
+    setHistoryIndex(newIndex);
+    updateAttachmentMask(attachment.id, { ...attachment.mask, pixelMask: history[newIndex] });
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
-    if (!isDrawing || !attachment || !canvasRef.current) return;
+    if (!isDrawing || !attachment || !attachment.mask.pixelMask || !canvasRef.current) return;
     
     const rect = canvasRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -78,7 +96,7 @@ export function BrushEditor() {
             edits.push({ x: px, y: py, radius: brush.radius, mode: brush.mode });
         }
 
-        const newMask = applyMaskEdits(attachment.mask, attachment.bounds.width, attachment.bounds.height, edits);
+        const newMask = applyMaskEdits(attachment.mask.pixelMask, attachment.mask.width, attachment.mask.height, edits);
         commitEdit(newMask);
     }
     
@@ -93,8 +111,8 @@ export function BrushEditor() {
         <h2 className="text-lg font-bold mb-2">Edit Mask: {attachment.id}</h2>
         <canvas
           ref={canvasRef}
-          width={attachment.bounds.width}
-          height={attachment.bounds.height}
+          width={attachment.mask.width}
+          height={attachment.mask.height}
           className="border border-gray-300"
           onPointerDown={(e) => {
               setIsDrawing(true);

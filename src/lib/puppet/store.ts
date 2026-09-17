@@ -16,6 +16,7 @@ import { KIND_LABEL } from "./templates";
 import type {
   AnimationDef,
   Attachment,
+  PartMask,
   BackgroundKey,
   Joint,
   SkeletonKind,
@@ -79,7 +80,7 @@ type StudioState = {
   setTime: (time: number) => void;
   setSpeed: (speed: number) => void;
   setBrush: (brush: Partial<BrushState>) => void;
-  updateAttachmentMask: (attachmentId: string, newMask: Uint8Array) => void;
+  updateAttachmentMask: (attachmentId: string, newMask: PartMask) => void;
   setAttachmentsNeedReview: (need: boolean) => void;
   toggleSweep: (id: string | null) => void;
   currentAngles: () => Record<string, number>;

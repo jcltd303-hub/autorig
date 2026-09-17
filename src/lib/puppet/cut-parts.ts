@@ -468,6 +468,8 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
         source: "auto",
         confidence: estimatePartConfidence(joint, pixelCount, cw, ch, joint.thickness),
       },
+      sourceVersion: 0,
+      repaired: false,
     });
   }
   return parts;

@@ -28,6 +28,7 @@ export type PartMask = {
   alphaPngDataUrl: string;
   source: PartMaskSource;
   confidence: number;
+  pixelMask?: Uint8Array;
 };
 
 export type BrushState = {
