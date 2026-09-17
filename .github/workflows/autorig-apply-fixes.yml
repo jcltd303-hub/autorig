@@ -1,0 +1,230 @@
+name: Apply autorig fixes
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Patch source
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def patch(path, replacements):
+              p = Path(path)
+              text = p.read_text()
+              for old, new in replacements:
+                  if text.count(old) != 1:
+                      raise SystemExit(f'{path}: expected exactly one match, got {text.count(old)} for {old[:100]!r}')
+                  text = text.replace(old, new)
+              p.write_text(text)
+
+          patch('src/lib/puppet/store.ts', [
+              (
+                  'if (!get().attachments.length || get().attachmentsNeedReview) {\n        void get().cutPaper();',
+                  'if (!get().attachments.length && !get().busy) {\n        void get().cutPaper();',
+              ),
+              (
+                  '        selectedId: selectedId === id ? null : selectedId,\n      jointVersion: jointVersion + 1,',
+                  '        selectedId: selectedId === id ? null : selectedId,\n      attachments: attachments.filter((attachment) => attachment.boneId !== id),\n      jointVersion: jointVersion + 1,',
+              ),
+              (
+                  '        attachments: [],\n        attachmentsNeedReview: true,\n        bg: key,',
+                  '        attachmentsNeedReview: get().attachments.length > 0,\n        bg: key,',
+              ),
+              (
+                  '  cutPaper: async () => {\n    const { source, joints, bg } = get();',
+                  '  cutPaper: async () => {\n    const draftVersion = get().jointVersion;\n    const { source, joints, bg } = get();',
+              ),
+              (
+                  '        attachments: parts,\n        attachmentsNeedReview: false,\n        partDraftVersion: get().jointVersion,',
+                  '        attachments: parts,\n        attachmentsNeedReview: get().jointVersion !== draftVersion,\n        partDraftVersion: draftVersion,',
+              ),
+          ])
+
+          patch('src/lib/puppet/yaml.ts', [
+              (
+                  '  const rest: Record<string, number> = {};\n  for (const joint of joints) rest[joint.id] = 0;\n\n  return {',
+                  '  const rest: Record<string, number> = {};\n  const jointsById = new Map(joints.map((joint) => [joint.id, joint]));\n  for (const joint of joints) rest[joint.id] = 0;\n\n  return {',
+              ),
+              (
+                  '      local_pivot: { x: round(attachment.localPivotX), y: round(attachment.localPivotY) },',
+                  '      local_pivot: (() => {\n        const bone = jointsById.get(attachment.boneId);\n        if (!bone) throw new Error(`Attachment "${attachment.id}" references missing bone "${attachment.boneId}"`);\n        return { x: round(bone.x - attachment.cropX), y: round(bone.y - attachment.cropY) };\n      })(),',
+              ),
+              (
+                  '2. Sort parts by z_index ascending.\n3. For each part, walk from the root to that joint and accumulate:',
+                  '2. Sort parts by z_index ascending.\n3. Resolve each attachment.bone against the current bones list.\n4. For each part, walk from the root to that joint and accumulate:',
+              ),
+              (
+                  '4. Draw the PNG at crop.x, crop.y.\n5. Clamp every angle to stop_points.min_angle .. max_angle.',
+                  '5. Draw the PNG at crop.x, crop.y.\n6. Clamp every angle to the referenced bone limits.',
+              ),
+          ])
+
+          image = Path('src/lib/puppet/image.ts')
+          text = image.read_text()
+          start = text.index('export function detectBackground(')
+          end = text.index('export function isBackground(', start)
+          detector = '''export function detectBackground(image: ImageData): BackgroundKey {
+            const { width, height, data } = image;
+            if (!width || !height) return { r: 0, g: 0, b: 0, threshold: 0, lift: false };
+
+            const samples: number[][] = [];
+            const strip = Math.max(1, Math.min(4, Math.floor(Math.min(width, height) / 32)));
+            const stride = Math.max(1, Math.floor(Math.max(width, height) / 256));
+            const sample = (x: number, y: number) => {
+              const i = (y * width + x) * 4;
+              if ((data[i + 3] ?? 0) < 250) return;
+              samples.push([data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0]);
+            };
+
+            for (let y = 0; y < height; y += stride) {
+              for (let k = 0; k < strip; k++) {
+                sample(k, y);
+                sample(width - 1 - k, y);
+              }
+            }
+            for (let x = strip; x < width - strip; x += stride) {
+              for (let k = 0; k < strip; k++) {
+                sample(x, k);
+                sample(x, height - 1 - k);
+              }
+            }
+            if (!samples.length) return { r: 0, g: 0, b: 0, threshold: 0, lift: false };
+
+            const percentile = (values: number[], fraction: number) => {
+              const sorted = [...values].sort((a, b) => a - b);
+              return sorted[Math.floor((sorted.length - 1) * fraction)] ?? 0;
+            };
+            const rgb = [0, 1, 2].map((channel) =>
+              percentile(samples.map((sample) => sample[channel] ?? 0), 0.5),
+            );
+            const distances = samples.map((sample) =>
+              colorDist(sample[0] ?? 0, sample[1] ?? 0, sample[2] ?? 0, rgb[0]!, rgb[1]!, rgb[2]!),
+            );
+            const spread = percentile(distances, 0.9);
+            const threshold = Math.max(18, Math.min(52, spread + 10));
+            const support = distances.filter((distance) => distance <= threshold).length / distances.length;
+            const candidate: BackgroundKey = {
+              r: rgb[0]!,
+              g: rgb[1]!,
+              b: rgb[2]!,
+              threshold,
+              lift: support >= 0.8 && spread <= 42,
+            };
+            if (!candidate.lift) return candidate;
+            const mask = buildFigureMask(image, candidate);
+            let figurePixels = 0;
+            for (const value of mask) figurePixels += value;
+            const ratio = figurePixels / (width * height);
+            return { ...candidate, lift: ratio >= 0.02 && ratio <= 0.95 };
+          }
+
+          '''
+          text = text[:start] + detector + text[end:]
+          image.write_text(text)
+
+          silhouette = Path('src/lib/puppet/silhouette.ts')
+          text = silhouette.read_text()
+          start = text.index('function extremum(')
+          end = text.index('function localWidth(', start)
+          helper = '''function regionEndpoint(
+            mask: Uint8Array,
+            width: number,
+            height: number,
+            region: (x: number, y: number) => boolean,
+            score: (x: number, y: number) => number,
+            fallback: { x: number; y: number },
+          ) {
+            let best = -Infinity;
+            let result = fallback;
+            for (let y = 0; y < height; y++) {
+              for (let x = 0; x < width; x++) {
+                if (!mask[y * width + x] || !region(x, y)) continue;
+                const value = score(x, y);
+                if (value > best) {
+                  best = value;
+                  result = { x, y };
+                }
+              }
+            }
+            return result;
+          }
+
+          '''
+          text = text[:start] + helper + text[end:]
+          replacements = [
+              (
+                  '  const handL = extremum(mask, width, height, (x, y) => -x - y * 0.15);',
+                  '''  const handL = regionEndpoint(\n    mask, width, height,\n    (x, y) => x < hips.x - bbox.w * 0.08 && y >= bbox.y + bbox.h * 0.22 && y <= bbox.y + bbox.h * 0.74,\n    (x, y) => hips.x - x - y * 0.05,\n    { x: hips.x - bbox.w * 0.28, y: bbox.y + bbox.h * 0.6 },\n  );''',
+              ),
+              (
+                  '  const handR = extremum(mask, width, height, (x, y) => x - y * 0.15);',
+                  '''  const handR = regionEndpoint(\n    mask, width, height,\n    (x, y) => x > hips.x + bbox.w * 0.08 && y >= bbox.y + bbox.h * 0.22 && y <= bbox.y + bbox.h * 0.74,\n    (x, y) => x - hips.x - y * 0.05,\n    { x: hips.x + bbox.w * 0.28, y: bbox.y + bbox.h * 0.6 },\n  );''',
+              ),
+              (
+                  '  const footL = extremum(mask, width, height, (x, y) => y - x * 0.35);',
+                  '''  const footL = regionEndpoint(\n    mask, width, height,\n    (x, y) => x < hips.x && y >= bbox.y + bbox.h * 0.78,\n    (x, y) => y - Math.abs(x - (hips.x - bbox.w * 0.12)) * 0.1,\n    { x: hips.x - bbox.w * 0.12, y: bbox.y + bbox.h * 0.95 },\n  );''',
+              ),
+              (
+                  '  const footR = extremum(mask, width, height, (x, y) => y + x * 0.35);',
+                  '''  const footR = regionEndpoint(\n    mask, width, height,\n    (x, y) => x > hips.x && y >= bbox.y + bbox.h * 0.78,\n    (x, y) => y - Math.abs(x - (hips.x + bbox.w * 0.12)) * 0.1,\n    { x: hips.x + bbox.w * 0.12, y: bbox.y + bbox.h * 0.95 },\n  );''',
+              ),
+              (
+                  'joint.thickness * 1.6, w * 1.05',
+                  'joint.thickness * 1.25, w',
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f'silhouette.ts: expected exactly one match for {old[:100]!r}')
+              text = text.replace(old, new)
+          silhouette.write_text(text)
+
+          stage = Path('src/components/studio/stage-canvas.tsx')
+          text = stage.read_text()
+          text = text.replace(
+              'const ordered = [...state.attachments].sort((a, b) => a.zIndex - b.zIndex);',
+              'const ordered = state.attachments.filter((attachment) => attachment.visible !== false).slice().sort((a, b) => a.zIndex - b.zIndex);',
+          )
+          text = text.replace('const r = 14 / fit.s;', 'const r = 24 / fit.s;')
+          text = text.replace(
+              '        onPointerUp={() => {\n          dragRef.current = null;\n        }}',
+              '        onPointerCancel={() => { dragRef.current = null; }}\n        onLostPointerCapture={() => { dragRef.current = null; }}\n        onPointerUp={() => {\n          dragRef.current = null;\n        }}',
+          )
+          stage.write_text(text)
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Commit verified changes and remove patch workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/lib/puppet/store.ts src/lib/puppet/yaml.ts src/lib/puppet/image.ts src/lib/puppet/silhouette.ts src/components/studio/stage-canvas.tsx
+          git rm .github/workflows/autorig-apply-fixes.yml
+          git commit -m "fix: preserve puppet cutouts across rig edits"
+          git push
