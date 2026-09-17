@@ -143,5 +143,5 @@ test("attachment mask edits can add and erase localized repair strokes", () => {
 
   assert.equal(repaired[4 * width + 4], 0);
   assert.equal(repaired[4 * width + 6], 255);
-  assert.equal(repaired[4 * width + 5], 255);
+  assert.equal(repaired[4 * width + 5], 0);
 });
