@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyMaskEdits, buildCutSegments, buildGeodesicOwnership, buildConstrainedOwnership } from "./cut-parts";
+import { buildCutSegments, buildGeodesicOwnership, buildConstrainedOwnership } from "./cut-parts";
+import { applyMaskEdits } from "./mask-utils";
 import { buildFigureMask, detectBackground } from "./image";
 const g = globalThis as typeof globalThis & { ImageData?: any };
 
