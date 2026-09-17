@@ -29,6 +29,7 @@ import { buildArchive, downloadBlob } from "@/lib/puppet/zip";
 import { cn } from "@/lib/utils";
 import { PartTiles, StageCanvas } from "./stage-canvas";
 import { AiImageModal } from "./ai-image-modal";
+import { BrushEditor } from "./brush-editor";
 
 function Mark({ className }: { className?: string }) {
   return (
@@ -176,7 +177,8 @@ export function StudioApp() {
       <main className="relative flex min-h-0 flex-1 flex-col">
         {step === "figure" || !source ? <FigureStep /> : <Workbench />}
         {busy ? (
-          <div className="absolute inset-0 z-20 flex items-center justify-center bg-bg/70">
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-4 bg-bg/70">
+            <div className="size-12 animate-spin rounded-full border-4 border-accent border-t-transparent" />
             <p className="font-display text-2xl italic text-ivory">{busy}</p>
           </div>
         ) : null}
@@ -525,7 +527,17 @@ function PartsInspector() {
 
       <div className="flex items-center gap-2">
         {needReview ? (
-          <Badge className="bg-amber-500/15 text-amber-300 border-amber-500/30">Pins moved — recut</Badge>
+          <div className="flex items-center gap-2">
+            <Badge className="bg-amber-500/15 text-amber-300 border-amber-500/30">Pins moved — recut</Badge>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 text-[10px]"
+              onClick={() => useStudio.getState().setAttachmentsNeedReview(false)}
+            >
+              Mark Reviewed
+            </Button>
+          </div>
         ) : (
           <Badge>{attachments.length} cutout layers</Badge>
         )}
@@ -575,10 +587,24 @@ function PartsInspector() {
                 >
                   <div className="checker-tile relative flex aspect-square w-full items-center justify-center overflow-hidden rounded bg-black/10">
                     <img src={part.dataUrl} alt={part.label} className="h-full w-full object-contain p-1" />
+                    {part.repaired && (
+                      <div className="absolute top-1 right-1 bg-emerald-500/80 size-2 rounded-full" title="Mask repaired" />
+                    )}
                   </div>
                   <div className="w-full truncate text-center">
                     <span className="block truncate text-xs font-medium text-fg">{part.label}</span>
                     <span className="text-[10px] text-muted">{part.width}×{part.height}px</span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-full mt-1 text-[10px] h-6"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        useStudio.getState().setBrush({ enabled: true, attachmentId: part.id });
+                      }}
+                    >
+                      Edit Mask
+                    </Button>
                   </div>
                 </button>
               );
@@ -586,6 +612,7 @@ function PartsInspector() {
           </div>
         </div>
       )}
+      <BrushEditor />
     </>
   );
 }

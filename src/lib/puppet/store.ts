@@ -21,6 +21,7 @@ import type {
   SkeletonKind,
   SourceFigure,
   StudioStep,
+  BrushState,
 } from "./types";
 
 type PinMode = "adjust" | "pin";
@@ -38,6 +39,7 @@ type StudioState = {
   attachmentsNeedReview: boolean;
   partDraftVersion: number;
   jointVersion: number;
+  brush: BrushState;
   animations: AnimationDef[];
   activeAnimId: string | null;
   playing: boolean;
@@ -76,28 +78,35 @@ type StudioState = {
   setPlaying: (playing: boolean) => void;
   setTime: (time: number) => void;
   setSpeed: (speed: number) => void;
+  setBrush: (brush: Partial<BrushState>) => void;
+  updateAttachmentMask: (attachmentId: string, newMask: Uint8Array) => void;
+  setAttachmentsNeedReview: (need: boolean) => void;
   toggleSweep: (id: string | null) => void;
   currentAngles: () => Record<string, number>;
   reset: () => void;
 };
 
 const blankBg: BackgroundKey = { r: 28, g: 25, b: 22, threshold: 36, lift: true };
+const decodeCache = new Map<string, { source: SourceFigure; bg: BackgroundKey; mask: Uint8Array }>();
 
 async function decodeFigure(dataUrl: string, name: string): Promise<{
   source: SourceFigure;
   bg: BackgroundKey;
   mask: Uint8Array;
 }> {
+  if (decodeCache.has(dataUrl)) return decodeCache.get(dataUrl)!;
   const prepared = await prepareSource(dataUrl);
   const img = await loadHtmlImage(prepared.dataUrl);
   const imageData = readImageData(img);
   const bg = detectBackground(imageData);
   const mask = buildFigureMask(imageData, bg);
-  return {
+  const result = {
     source: { dataUrl: prepared.dataUrl, width: prepared.width, height: prepared.height, name },
     bg,
     mask,
   };
+  decodeCache.set(dataUrl, result);
+  return result;
 }
 
 export const useStudio = create<StudioState>((set, get) => ({
@@ -113,6 +122,13 @@ export const useStudio = create<StudioState>((set, get) => ({
   attachmentsNeedReview: false,
   partDraftVersion: 0,
   jointVersion: 0,
+  brush: {
+    mode: "add",
+    radius: 20,
+    opacity: 1,
+    enabled: false,
+    attachmentId: null,
+  },
   animations: [],
   activeAnimId: null,
   playing: false,
@@ -389,8 +405,15 @@ export const useStudio = create<StudioState>((set, get) => ({
   },
   cutPaper: async () => {
     const draftVersion = get().jointVersion;
-    const { source, joints, bg } = get();
+    const { source, joints, bg, attachments, partDraftVersion } = get();
     if (!source || !joints.length) return;
+
+    // Optimization: If parts already cut and joints haven't changed, just move to next step
+    if (attachments.length && partDraftVersion === draftVersion) {
+      set({ step: "parts" });
+      return;
+    }
+
     set({ busy: "Cutting paper into parts...", error: null });
     try {
       let activeBg = bg;
@@ -403,16 +426,23 @@ export const useStudio = create<StudioState>((set, get) => ({
           activeBg = blankBg;
         }
       }
+      
       const parts = await cutParts(source.dataUrl, joints, activeBg ?? blankBg);
       if (!parts.length) {
         throw new Error("No parts could be cut from the silhouette. Please check pin placements.");
       }
+      
       const animations = get().animations.length
         ? get().animations
         : [presetAnimation("idle", joints), presetAnimation("walk", joints)];
+      
       set({
-        attachments: parts,
-        attachmentsNeedReview: get().jointVersion !== draftVersion,
+        attachments: parts.map((p) => {
+          // Preserve mask/repair state if exists
+          const existing = attachments.find(a => a.id === p.id);
+          return existing ? { ...p, mask: existing.mask, sourceVersion: existing.sourceVersion, repaired: existing.repaired } : { ...p, sourceVersion: 0, repaired: false };
+        }),
+        attachmentsNeedReview: false, // Resetting review flag since we just did a fresh cut
         partDraftVersion: draftVersion,
         busy: null,
         animations,
@@ -478,13 +508,22 @@ export const useStudio = create<StudioState>((set, get) => ({
   setPlaying: (playing) => set({ playing }),
   setTime: (time) => set({ time }),
   setSpeed: (speed) => set({ speed }),
+  setBrush: (brush) => set((s) => ({ brush: { ...s.brush, ...brush } })),
+  updateAttachmentMask: (attachmentId, newMask) =>
+    set((s) => ({
+      attachments: s.attachments.map((a) =>
+        a.id === attachmentId ? { ...a, mask: newMask, repaired: true, sourceVersion: a.sourceVersion + 1 } : a
+      ),
+    })),
+  setAttachmentsNeedReview: (need) => set({ attachmentsNeedReview: need }),
   toggleSweep: (id) => set({ sweepId: get().sweepId === id ? null : id, playing: false }),
   currentAngles: () => {
     const { joints, animations, activeAnimId, time } = get();
     const anim = animations.find((a) => a.id === activeAnimId) ?? null;
     return anglesAt(joints, anim, time);
   },
-  reset: () =>
+  reset: () => {
+    decodeCache.clear();
     set({
       step: "figure",
       source: null,
@@ -502,7 +541,9 @@ export const useStudio = create<StudioState>((set, get) => ({
       busy: null,
       error: null,
       sweepId: null,
-    }),
+      brush: { mode: "add", radius: 20, opacity: 1, enabled: false, attachmentId: null },
+    });
+  },
     needsRecut: () => {
       const { attachments, attachmentsNeedReview, partDraftVersion, jointVersion } = get();
       return !!attachments.length && (attachmentsNeedReview || partDraftVersion !== jointVersion);

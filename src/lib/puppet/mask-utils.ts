@@ -30,11 +30,12 @@ export function applyMaskEdits(
     const maxY = Math.min(height - 1, Math.ceil(edit.y + radius));
     const radiusSquared = radius * radius;
     for (let y = minY; y <= maxY; y++) {
+      const rowOffset = y * width;
       for (let x = minX; x <= maxX; x++) {
         const dx = x - edit.x;
         const dy = y - edit.y;
         if (dx * dx + dy * dy > radiusSquared) continue;
-        result[y * width + x] = edit.mode === "add" ? 255 : 0;
+        result[rowOffset + x] = edit.mode === "add" ? 255 : 0;
       }
     }
   }

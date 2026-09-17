@@ -26,17 +26,25 @@ function sourceMask(image: ImageData, bg: BackgroundKey) {
   for (let i = 0; i < mask.length; i++) {
     if (mask[i]) fgCount++;
   }
-  // If fewer than 1.5% of total pixels were detected as foreground, background lifting likely flooded
-  // the figure or failed. Fall back to transparency check or full canvas foreground.
-  if (fgCount < image.width * image.height * 0.015) {
-    mask = buildFigureMask(image, { r: 0, g: 0, b: 0, threshold: 0, lift: false });
-    fgCount = 0;
-    for (let i = 0; i < mask.length; i++) {
-      if (mask[i]) fgCount++;
+  
+  // Improvement: Check for figure presence more aggressively if initial background detection fails
+  if (fgCount < image.width * image.height * 0.005) {
+    // Try a simpler background detection or a fallback to transparency
+    const fallbackMask = buildFigureMask(image, { r: 0, g: 0, b: 0, threshold: 20, lift: false });
+    let fallbackFgCount = 0;
+    for (let i = 0; i < fallbackMask.length; i++) {
+      if (fallbackMask[i]) fallbackFgCount++;
     }
-    if (fgCount < image.width * image.height * 0.015) {
-      mask.fill(1);
+    
+    if (fallbackFgCount > fgCount) {
+        mask = fallbackMask;
+        fgCount = fallbackFgCount;
     }
+  }
+
+  // If still very little detected, assume the whole canvas is the figure
+  if (fgCount < image.width * image.height * 0.005) {
+    mask.fill(1);
   }
   return mask;
 }

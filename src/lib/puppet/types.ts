@@ -30,6 +30,14 @@ export type PartMask = {
   confidence: number;
 };
 
+export type BrushState = {
+  mode: "add" | "erase";
+  radius: number;
+  opacity: number;
+  enabled: boolean;
+  attachmentId: string | null;
+};
+
 export type AttachmentRole = "main" | "overlap" | "repair";
 
 export type Attachment = {
@@ -54,6 +62,8 @@ export type Attachment = {
   pixelCount: number;
   mask: PartMask;
   visible?: boolean;
+  sourceVersion: number;
+  repaired: boolean;
 };
 
 export type CutPart = Attachment;
