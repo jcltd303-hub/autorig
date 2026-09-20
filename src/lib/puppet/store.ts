@@ -272,7 +272,6 @@ export const useStudio = create<StudioState>((set, get) => ({
       ctx.drawImage(img, 0, 0);
       const dataUrl = canvas.toDataURL("image/png");
       await get().loadDataUrl(dataUrl, name, kind);
-      const state = get();
     } catch (err) {
       set({ busy: null, error: err instanceof Error ? err.message : "Could not open the example" });
     }

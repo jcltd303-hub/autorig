@@ -1,5 +1,6 @@
 import { buildFigureMask, loadHtmlImage, readImageData } from "./image";
 import type { BackgroundKey, CutPart, Joint } from "./types";
+import { ensureSmoothMask } from "./mask-utils";
 
 type Segment = {
   joint: Joint;
@@ -12,6 +13,12 @@ type Segment = {
   y?: number;
   /** Explicitly marks terminal/leaf geometry; omitted legacy callers remain articulated. */
   leaf?: boolean;
+  isHip?: boolean;
+  legStarts?: Joint[];
+  minX?: number;
+  maxX?: number;
+  minY?: number;
+  maxY?: number;
 };
 
 type OwnershipSegment = Omit<Segment, "joint"> & { joint?: Joint };
@@ -74,6 +81,63 @@ function segmentProjection(px: number, py: number, ax: number, ay: number, bx: n
 export function buildCutSegments(joints: Joint[]): Segment[] {
   return joints.map((joint) => {
     const kids = childrenOf(joint.id, joints);
+
+    // Check if this joint represents the hips / pelvis
+    const isHipRoot =
+      joint.id === "hips" ||
+      (joint.id.includes("hip") && !joint.parentId) ||
+      joint.id === "pelvis" ||
+      joint.label.toLowerCase().includes("hip");
+
+    if (isHipRoot) {
+      // Find leg start joints: hip_l, hip_r or children representing left/right leg starts
+      const legStarts = kids.filter(
+        (k) =>
+          k.id.includes("hip_") ||
+          k.id.includes("thigh") ||
+          k.id.includes("leg") ||
+          k.label.toLowerCase().includes("hip") ||
+          k.label.toLowerCase().includes("thigh") ||
+          k.label.toLowerCase().includes("leg"),
+      );
+      const actualLegStarts =
+        legStarts.length > 0
+          ? legStarts
+          : kids.filter((k) => !k.id.includes("spine") && !k.id.includes("chest") && !k.id.includes("torso"));
+
+      const spineKid = kids.find((k) => k.id.includes("spine") || k.id.includes("chest") || k.id.includes("torso"));
+      const bx = spineKid ? spineKid.x : joint.x;
+      const by = spineKid ? spineKid.y : joint.y;
+
+      let minX = joint.x - joint.thickness;
+      let maxX = joint.x + joint.thickness;
+      let minY = joint.y - joint.thickness;
+      let maxY = joint.y + joint.thickness;
+
+      for (const leg of actualLegStarts) {
+        minX = Math.min(minX, leg.x - leg.thickness);
+        maxX = Math.max(maxX, leg.x + leg.thickness);
+        minY = Math.min(minY, leg.y - leg.thickness);
+        maxY = Math.max(maxY, leg.y + leg.thickness);
+      }
+
+      return {
+        joint,
+        ax: joint.x,
+        ay: joint.y,
+        bx,
+        by,
+        radius: Math.max(10, joint.thickness * 1.2),
+        leaf: false,
+        isHip: true,
+        legStarts: actualLegStarts,
+        minX,
+        maxX,
+        minY,
+        maxY,
+      };
+    }
+
     if (kids.length === 1) {
       const child = kids[0]!;
       return { joint, ax: joint.x, ay: joint.y, bx: child.x, by: child.y, radius: Math.max(6, joint.thickness), leaf: false };
@@ -384,6 +448,13 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
       if (!childOverlap) continue;
       for (let i = 0; i < boundsOverlap.length; i++) if (childOverlap[i]) boundsOverlap[i] = 1;
     }
+    if (segment.isHip && segment.legStarts) {
+      for (const leg of segment.legStarts) {
+        const legOverlap = overlaps.get(leg.id);
+        if (!legOverlap) continue;
+        for (let i = 0; i < boundsOverlap.length; i++) if (legOverlap[i]) boundsOverlap[i] = 1;
+      }
+    }
     const bounds = boundsForPart(owner, mask, boundsOverlap, partIndex, width, height);
 
     let cropMinX = bounds ? Math.max(0, bounds.minX - 4) : 0;
@@ -410,10 +481,51 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
               }
             }
           }
-          if (!mask[srcIndex] || (!isOwned && !isOverlap)) continue;
-          alpha[y * cw + x] = 255;
+
+          // Initial part geometric guarantee:
+          // 1. Joint circle itself (socket circle)
+          const dJointCenterSq = (sx - joint.x) ** 2 + (sy - joint.y) ** 2;
+          const jointR = joint.thickness;
+          const inJointCircle = dJointCenterSq <= jointR * jointR;
+
+          // 2. Joints filled with curved lines between them (smooth capsule / corridor)
+          let inCurvedBridge = false;
+          if (!segment.leaf && (segment.ax !== segment.bx || segment.ay !== segment.by)) {
+            const dLineSq = pointSegmentDistanceSquared(sx, sy, segment.ax, segment.ay, segment.bx, segment.by);
+            const rBridge = segment.radius;
+            if (dLineSq <= rBridge * rBridge) {
+              inCurvedBridge = true;
+            }
+          }
+
+          // 3. For hip: must contain hip circle and both leg start circles, plus curved connection
+          let inHipStructure = false;
+          if (segment.isHip && segment.legStarts) {
+            for (const leg of segment.legStarts) {
+              const dLegSq = (sx - leg.x) ** 2 + (sy - leg.y) ** 2;
+              if (dLegSq <= leg.thickness * leg.thickness) {
+                inHipStructure = true;
+                break;
+              }
+              const dHipLegSq = pointSegmentDistanceSquared(sx, sy, joint.x, joint.y, leg.x, leg.y);
+              const rAvg = (joint.thickness + leg.thickness) * 0.55;
+              if (dHipLegSq <= rAvg * rAvg) {
+                inHipStructure = true;
+                break;
+              }
+            }
+          }
+
+          if (
+            mask[srcIndex] &&
+            (isOwned || isOverlap || inJointCircle || inCurvedBridge || inHipStructure)
+          ) {
+            alpha[y * cw + x] = 255;
+          }
         }
       }
+      // Apply smooth edge pass to eliminate 1px hangs and ensure actually smooth paths
+      alpha = ensureSmoothMask(alpha, cw, ch, joint.x - cropMinX, joint.y - cropMinY);
     }
 
     let rendered = bounds && cw > 0 && ch > 0

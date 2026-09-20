@@ -12,6 +12,9 @@ import {
   Wand2,
   Paintbrush,
   Ghost,
+  Crosshair,
+  Eye,
+  Sliders,
 } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -87,17 +90,6 @@ export function StudioApp() {
   const loadFile = useStudio((s) => s.loadFile);
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiModalTab, setAiModalTab] = useState<"create" | "edit">("create");
-
-  const [windowSize, setWindowSize] = useState({ width: 0, height: 0 });
-
-  useEffect(() => {
-    const onResize = () => {
-      setWindowSize({ width: window.innerWidth, height: window.innerHeight });
-    };
-    onResize();
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -327,28 +319,134 @@ function FigureStep() {
 function Workbench() {
   const step = useStudio((s) => s.step);
   const attachments = useStudio((s) => s.attachments);
+  const joints = useStudio((s) => s.joints);
+  const selectedId = useStudio((s) => s.selectedId);
+  const [mobileTab, setMobileTab] = useState<"stage" | "controls">("stage");
+
   return (
-    <div className="grid h-full min-h-0 flex-1 grid-cols-[auto_1fr_auto] p-4 gap-4 overflow-auto">
-      <aside className="flex flex-col gap-2">
-        {step === "bones" ? <BonesInspectorSidebar /> : null}
-      </aside>
-      <section className="flex min-h-0 flex-col gap-3 overflow-auto">
-        <div className="min-h-0 flex-1 rounded-xl bg-surface border border-border">
-          <StageCanvas mode={step === "bones" ? "bones" : "puppet"} />
+    <div className="flex flex-col h-full min-h-0 flex-1 overflow-hidden p-2 md:p-4">
+      {/* Mobile Tab Switcher (< md) */}
+      <div className="flex md:hidden items-center justify-between gap-2 pb-2 shrink-0">
+        <div className="flex rounded-lg bg-elevated p-1 border border-border flex-1">
+          <button
+            type="button"
+            onClick={() => setMobileTab("stage")}
+            className={cn(
+              "flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium transition-colors",
+              mobileTab === "stage"
+                ? "bg-accent text-accent-fg shadow-sm"
+                : "text-muted hover:text-fg"
+            )}
+          >
+            <Sparkles className="size-3.5" />
+            <span>Stage &amp; Bones ({joints.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMobileTab("controls")}
+            className={cn(
+              "flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium transition-colors",
+              mobileTab === "controls"
+                ? "bg-accent text-accent-fg shadow-sm"
+                : "text-muted hover:text-fg"
+            )}
+          >
+            <Sliders className="size-3.5" />
+            <span>Inspector &amp; Pins</span>
+          </button>
         </div>
-        {step === "parts" || step === "archive" ? <PartTiles attachments={attachments} /> : null}
-        {step === "motion" ? <Timeline /> : null}
-      </section>
-      <aside className="h-full w-80">
-        <ScrollArea className="h-full rounded-xl border border-border bg-surface">
-          <div className="flex flex-col gap-5 p-4">
-            {step === "bones" ? <BonesInspector /> : null}
-            {step === "parts" ? <PartsInspector /> : null}
-            {step === "motion" ? <MotionInspector /> : null}
-            {step === "archive" ? <ArchiveInspector /> : null}
+      </div>
+
+      {/* Main Responsive Grid Layout */}
+      <div className="flex-1 min-h-0 flex flex-col md:grid md:grid-cols-[auto_1fr_320px] lg:grid-cols-[auto_1fr_360px] gap-3 md:gap-4 overflow-hidden">
+        {/* Left Toolbar: visible on desktop */}
+        <aside className="hidden md:flex md:flex-col gap-2 shrink-0">
+          {step === "bones" ? <BonesInspectorSidebar /> : null}
+        </aside>
+
+        {/* Center Canvas: Always visible on desktop; on mobile visible if mobileTab === 'stage' */}
+        <section
+          className={cn(
+            "flex-1 min-h-0 flex flex-col gap-3 overflow-hidden relative",
+            mobileTab !== "stage" && "hidden md:flex"
+          )}
+        >
+          <div className="relative min-h-[360px] flex-1 rounded-xl bg-surface border border-border overflow-hidden">
+            {/* Mobile floating toolstrip inside stage */}
+            {step === "bones" ? (
+              <div className="md:hidden absolute top-3 left-3 z-10 flex flex-col gap-1.5 bg-surface/90 backdrop-blur-md p-1.5 rounded-xl border border-border shadow-lg">
+                <BonesInspectorSidebar />
+              </div>
+            ) : null}
+
+            <StageCanvas mode={step === "bones" ? "bones" : "puppet"} />
+
+            {/* Mobile bottom quick bar in stage mode */}
+            <div className="md:hidden absolute bottom-3 left-3 right-3 z-10 flex items-center justify-between gap-2 bg-surface/95 backdrop-blur-md px-3 py-2 rounded-xl border border-border shadow-xl">
+              <div className="flex items-center gap-2 truncate">
+                <Badge variant="outline" className="border-accent/40 text-accent text-[10px] py-0 px-1.5 shrink-0">
+                  {joints.length} bones
+                </Badge>
+                <span className="text-xs text-fg font-medium truncate">
+                  {selectedId ? joints.find((j) => j.id === selectedId)?.label : "Tap pin on figure"}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs px-2.5"
+                  onClick={() => setMobileTab("controls")}
+                >
+                  Adjust Pins
+                </Button>
+                {step === "bones" ? (
+                  <Button
+                    size="sm"
+                    className="h-7 text-xs px-2.5 bg-accent text-accent-fg font-semibold shadow-sm"
+                    onClick={() => void useStudio.getState().cutPaper()}
+                  >
+                    Cut Parts
+                  </Button>
+                ) : null}
+              </div>
+            </div>
           </div>
-        </ScrollArea>
-      </aside>
+          {step === "parts" || step === "archive" ? <PartTiles attachments={attachments} /> : null}
+          {step === "motion" ? <Timeline /> : null}
+        </section>
+
+        {/* Right Inspector: Always visible on desktop; on mobile visible if mobileTab === 'controls' */}
+        <aside
+          className={cn(
+            "h-full w-full md:w-80 lg:w-96 shrink-0 overflow-hidden",
+            mobileTab !== "controls" && "hidden md:block"
+          )}
+        >
+          <ScrollArea className="h-full rounded-xl border border-border bg-surface">
+            <div className="flex flex-col gap-4 p-4">
+              {/* Mobile return button */}
+              <div className="md:hidden flex items-center justify-between pb-2 border-b border-border">
+                <span className="text-xs text-muted">Bones &amp; Settings</span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs gap-1.5 text-accent border-accent/40"
+                  onClick={() => setMobileTab("stage")}
+                >
+                  <Eye className="size-3.5" />
+                  View on Stage
+                </Button>
+              </div>
+
+              {step === "bones" ? <BonesInspector onSwitchToStage={() => setMobileTab("stage")} /> : null}
+              {step === "parts" ? <PartsInspector /> : null}
+              {step === "motion" ? <MotionInspector /> : null}
+              {step === "archive" ? <ArchiveInspector /> : null}
+            </div>
+          </ScrollArea>
+        </aside>
+      </div>
     </div>
   );
 }
@@ -384,7 +482,7 @@ function BonesInspectorSidebar() {
   );
 }
 
-function BonesInspector() {
+function BonesInspector({ onSwitchToStage }: { onSwitchToStage?: () => void }) {
   const kind = useStudio((s) => s.kind);
   const joints = useStudio((s) => s.joints);
   const selectedId = useStudio((s) => s.selectedId);
@@ -397,13 +495,33 @@ function BonesInspector() {
   return (
     <>
       <div className="space-y-1">
-        <h2 className="font-display text-2xl">Bones</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="font-display text-2xl">Bones &amp; Rotation Pins</h2>
+          <Badge variant="outline" className="border-accent/40 text-accent gap-1 text-[11px] py-0.5">
+            <Crosshair className="size-3" />
+            1px Crosshairs
+          </Badge>
+        </div>
         <p className="text-sm text-pretty text-muted">
-          Drag pins onto hinges. Or walk the skeleton by placing each joint in order.
+          Review pins and rotation points before cutting. Each hinge displays 1px crosshairs and concentric circles (core, socket, overlap).
         </p>
       </div>
+
+      <div className="rounded-lg border border-accent/25 bg-accent/5 p-2.5 text-xs text-muted flex items-start gap-2">
+        <Crosshair className="size-4 text-accent shrink-0 mt-0.5" />
+        <div>
+          <p className="font-medium text-fg">Precision Pinning Review</p>
+          <p className="text-[11px] text-muted leading-relaxed">
+            Verify rotation points on hinges. Concentric circles define your part socket overlap to eliminate dangling cut artifacts.
+          </p>
+        </div>
+      </div>
+
       <div className="space-y-2">
-        <Label>Skeleton</Label>
+        <div className="flex items-center justify-between">
+          <Label>Skeleton</Label>
+          <span className="text-[11px] text-muted font-mono">{KIND_LABEL[kind]}</span>
+        </div>
         <div className="flex flex-wrap gap-1.5">
           {(Object.keys(KIND_LABEL) as SkeletonKind[]).map((k) => (
             <button
@@ -411,14 +529,53 @@ function BonesInspector() {
               type="button"
               onClick={() => useStudio.getState().setKind(k)}
               className={cn(
-                "size-11 rounded-lg flex items-center justify-center text-xs",
-                k === kind ? "bg-accent text-accent-fg" : "bg-elevated text-muted",
+                "size-11 rounded-lg flex items-center justify-center text-xs font-medium transition-all",
+                k === kind ? "bg-accent text-accent-fg ring-2 ring-accent/30" : "bg-elevated text-muted hover:text-fg hover:bg-elevated/80",
               )}
               title={KIND_LABEL[k]}
             >
               {KIND_LABEL[k].slice(0, 2)}
             </button>
           ))}
+        </div>
+      </div>
+
+      {/* Bones & Rotation Pins Hierarchy List */}
+      <div className="space-y-2 rounded-lg border border-border bg-elevated/40 p-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold text-fg flex items-center gap-1.5">
+            <Pin className="size-3.5 text-accent" />
+            Bone Hierarchy ({joints.length} pins)
+          </span>
+          <span className="text-[10px] text-muted">Tap to inspect hinge</span>
+        </div>
+        <div className="grid grid-cols-2 gap-1.5 max-h-48 overflow-y-auto pr-1">
+          {joints.map((joint) => {
+            const isSel = joint.id === selectedId;
+            return (
+              <button
+                key={joint.id}
+                type="button"
+                onClick={() => {
+                  useStudio.getState().setSelected(joint.id);
+                  onSwitchToStage?.();
+                }}
+                className={cn(
+                  "flex items-center justify-between gap-1 rounded px-2 py-1.5 text-left text-xs transition-colors border",
+                  isSel
+                    ? "border-accent bg-accent/20 text-fg font-medium shadow-xs"
+                    : "border-border/60 bg-surface/80 text-muted hover:text-fg hover:bg-elevated"
+                )}
+                title={`Select ${joint.label}`}
+              >
+                <div className="flex items-center gap-1.5 truncate">
+                  <span className={cn("size-2 rounded-full shrink-0", isSel ? "bg-accent shadow-xs" : "bg-muted/50")} />
+                  <span className="truncate">{joint.label}</span>
+                </div>
+                <span className="text-[10px] text-muted shrink-0">R:{Math.round(joint.thickness)}</span>
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -479,40 +636,65 @@ function BonesInspector() {
           Click the <span className="font-medium">{next.label}</span>
         </p>
       ) : null}
-      {selected ? <JointFields joint={selected} /> : <p className="text-sm text-muted">Select a pin to edit its range.</p>}
+      {selected ? (
+        <JointFields joint={selected} onSwitchToStage={onSwitchToStage} />
+      ) : (
+        <p className="text-sm text-muted">Select a pin above or on stage to edit its range.</p>
+      )}
       <Button
         onClick={() => void useStudio.getState().cutPaper()}
         disabled={busy !== null}
-        className="gap-2"
+        className="gap-2 bg-accent text-accent-fg hover:bg-ivory shadow-md font-semibold transition-all"
       >
         <Scissors className="size-4" />
-        {busy?.includes("Cutting") ? "Cutting paper..." : "Cut paper"}
+        {busy?.includes("Cutting") ? "Cutting paper parts..." : "Review Complete — Cut Parts"}
       </Button>
     </>
   );
 }
 
-function JointFields({ joint }: { joint: Joint }) {
+function JointFields({ joint, onSwitchToStage }: { joint: Joint; onSwitchToStage?: () => void }) {
   const j = useStudio((s) => s.joints.find((x) => x.id === joint.id));
   const update = useStudio((s) => s.updateJoint);
   if (!j) return null;
   return (
     <div className="space-y-3 rounded-lg bg-elevated p-3 shadow-border">
       <div className="flex items-center justify-between gap-2">
-        <p className="font-medium">{j.label}</p>
-        <button
-          type="button"
-          className="flex size-11 items-center justify-center text-muted hover:text-danger"
-          onClick={() => useStudio.getState().deleteJoint(j.id)}
-          aria-label="Remove joint"
-        >
-          <Trash2 className="size-4" />
-        </button>
+        <div>
+          <p className="font-semibold text-fg flex items-center gap-1.5">
+            <span className="size-2 rounded-full bg-accent inline-block" />
+            {j.label}
+          </p>
+          <p className="text-[11px] text-muted">
+            {j.parentId ? `Linked to ${j.parentId.replace(/_/g, " ")}` : "Root hinge"}
+          </p>
+        </div>
+        <div className="flex items-center gap-1">
+          {onSwitchToStage ? (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs gap-1 md:hidden text-accent border-accent/30"
+              onClick={onSwitchToStage}
+            >
+              <Eye className="size-3" />
+              Stage
+            </Button>
+          ) : null}
+          <button
+            type="button"
+            className="flex size-8 items-center justify-center rounded text-muted hover:text-danger hover:bg-danger/10 transition-colors"
+            onClick={() => useStudio.getState().deleteJoint(j.id)}
+            aria-label="Remove joint"
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </div>
       </div>
       <Field label="Min angle" value={j.minAngle} min={-180} max={180} onChange={(v) => update(j.id, { minAngle: v })} />
       <Field label="Max angle" value={j.maxAngle} min={-180} max={180} onChange={(v) => update(j.id, { maxAngle: v })} />
-      <Field label="Thickness" value={Math.round(j.thickness)} min={4} max={80} onChange={(v) => update(j.id, { thickness: v })} />
-      <Button variant="outline" size="sm" className="w-full" onClick={() => useStudio.getState().toggleSweep(j.id)}>
+      <Field label="Socket Radius (px)" value={Math.round(j.thickness)} min={4} max={80} onChange={(v) => update(j.id, { thickness: v })} />
+      <Button variant="outline" size="sm" className="w-full text-xs" onClick={() => useStudio.getState().toggleSweep(j.id)}>
         Sweep range of motion
       </Button>
     </div>
@@ -552,7 +734,19 @@ function PartsInspector() {
   return (
     <>
       <div className="space-y-1">
-        <h2 className="font-display text-2xl">Parts</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="font-display text-2xl">Parts</h2>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => useStudio.getState().setStep("bones")}
+            className="h-7 text-xs gap-1.5 text-muted hover:text-fg"
+            title="Review bone pinning and rotation crosshairs"
+          >
+            <Crosshair className="size-3 text-accent" />
+            Review Pins
+          </Button>
+        </div>
         <p className="text-sm text-pretty text-muted">
           Each limb is a transparent paper layer with extra paper over the parent pivot, so the hinge stays
           covered through motion.

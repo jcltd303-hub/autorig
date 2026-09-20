@@ -1,11 +1,20 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { contain, loadHtmlImage } from "@/lib/puppet/image";
 import { useStudio } from "@/lib/puppet/store";
 import { anglesAt } from "@/lib/puppet/animate";
 import type { Attachment, Joint } from "@/lib/puppet/types";
 import { cn } from "@/lib/utils";
+import { Paintbrush } from "lucide-react";
 
-const imageCache = new Map<string, HTMLImageElement>();
+export const imageCache = new Map<string, HTMLImageElement>();
+
+export function clearImageCache(src?: string) {
+  if (src) {
+    imageCache.delete(src);
+  } else {
+    imageCache.clear();
+  }
+}
 
 async function cached(src: string) {
   const hit = imageCache.get(src);
@@ -65,9 +74,16 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
   const attachments = useStudio((s) => s.attachments);
   const setSelected = useStudio((s) => s.setSelected);
   const moveJoint = useStudio((s) => s.moveJoint);
+  const updateJoint = useStudio((s) => s.updateJoint);
   const placeNextPin = useStudio((s) => s.placeNextPin);
   const fitRef = useRef({ x: 0, y: 0, w: 0, h: 0, s: 1 });
-  const dragRef = useRef<string | null>(null);
+  const dragRef = useRef<
+    | { type: "move"; jointId: string }
+    | { type: "resize"; jointId: string; centerX: number; centerY: number }
+    | null
+  >(null);
+  const [canvasCursor, setCanvasCursor] = useState<string>("default");
+  const [activeResizeId, setActiveResizeId] = useState<string | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -154,6 +170,7 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
             state.joints,
             state.selectedId,
             state.pinMode === "pin" ? (state.joints[state.pinIndex]?.id ?? null) : null,
+            activeResizeId,
           );
         } else {
           const byId = new Map(state.joints.map((j) => [j.id, j]));
@@ -168,13 +185,16 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
               applyChain(ctx, joint, byId, angles);
               ctx.drawImage(img, attachment.cropX, attachment.cropY);
               if (state.step === "parts" && state.selectedId === attachment.boneId) {
-                ctx.fillStyle = "#e05a47";
-                ctx.beginPath();
-                ctx.arc(joint.x, joint.y, 5, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.strokeStyle = "#ffffff";
-                ctx.lineWidth = 2;
-                ctx.stroke();
+                drawRotationCrosshair(
+                  ctx,
+                  joint.x,
+                  joint.y,
+                  joint.thickness,
+                  true,
+                  false,
+                  activeResizeId === joint.id,
+                  joint.label,
+                );
               }
               ctx.restore();
             } catch {
@@ -202,7 +222,7 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
       cancelAnimationFrame(raf);
       ro.disconnect();
     };
-  }, [source, joints, selectedId, pinMode, pinIndex, attachments, mode]);
+  }, [source, joints, selectedId, pinMode, pinIndex, attachments, mode, activeResizeId]);
 
   function imagePoint(e: React.PointerEvent) {
     const canvas = canvasRef.current;
@@ -217,25 +237,62 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
     };
   }
 
-  function hitJoint(x: number, y: number) {
+  function hitJoint(x: number, y: number): { joint: Joint; type: "move" | "resize" } | null {
     const fit = fitRef.current;
-    const r = 14 / fit.s;
-    let best: Joint | null = null;
-    let bestD = r;
-    for (const joint of joints) {
-      const d = Math.hypot(joint.x - x, joint.y - y);
-      if (d <= bestD) {
-        bestD = d;
-        best = joint;
+    const s = fit.s || 1;
+
+    // Check currently selected joint first for responsive handling
+    if (selectedId) {
+      const sel = joints.find((j) => j.id === selectedId);
+      if (sel) {
+        const d = Math.hypot(sel.x - x, sel.y - y);
+        const centerHitR = Math.max(14 / s, Math.min(20, sel.thickness * 0.4));
+        if (d <= centerHitR) {
+          return { joint: sel, type: "move" };
+        }
+        // Draggable circle zone: within socket circle radius range
+        const socketR = sel.thickness;
+        const minRim = Math.max(8 / s, socketR * 0.45);
+        const maxRim = Math.max(socketR * 1.5 + 14 / s, 36 / s);
+        if (d >= minRim && d <= maxRim) {
+          return { joint: sel, type: "resize" };
+        }
       }
     }
-    return best;
+
+    let bestMove: { joint: Joint; dist: number } | null = null;
+    let bestResize: { joint: Joint; dist: number } | null = null;
+
+    for (const joint of joints) {
+      const d = Math.hypot(joint.x - x, joint.y - y);
+      const centerHitR = Math.max(14 / s, Math.min(20, joint.thickness * 0.4));
+      if (d <= centerHitR) {
+        if (!bestMove || d < bestMove.dist) {
+          bestMove = { joint, dist: d };
+        }
+      } else {
+        const socketR = joint.thickness;
+        const minRim = Math.max(8 / s, socketR * 0.45);
+        const maxRim = Math.max(socketR * 1.5 + 14 / s, 36 / s);
+        if (d >= minRim && d <= maxRim) {
+          const rimDist = Math.abs(d - socketR);
+          if (!bestResize || rimDist < bestResize.dist) {
+            bestResize = { joint, dist: rimDist };
+          }
+        }
+      }
+    }
+
+    if (bestMove) return { joint: bestMove.joint, type: "move" };
+    if (bestResize) return { joint: bestResize.joint, type: "resize" };
+    return null;
   }
 
   return (
     <div ref={wrapRef} className="relative h-full min-h-72 w-full overflow-hidden rounded-lg bg-surface">
       <canvas
         ref={canvasRef}
+        style={{ cursor: canvasCursor }}
         className="block h-full w-full touch-none"
         onPointerDown={(e) => {
           if (mode !== "bones" || !source) return;
@@ -248,24 +305,170 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
           }
           const hit = hitJoint(p.x, p.y);
           if (hit) {
-            setSelected(hit.id);
-            dragRef.current = hit.id;
+            setSelected(hit.joint.id);
+            if (hit.type === "resize") {
+              dragRef.current = {
+                type: "resize",
+                jointId: hit.joint.id,
+                centerX: hit.joint.x,
+                centerY: hit.joint.y,
+              };
+              setActiveResizeId(hit.joint.id);
+            } else {
+              dragRef.current = {
+                type: "move",
+                jointId: hit.joint.id,
+              };
+              setActiveResizeId(null);
+            }
           } else {
             setSelected(null);
+            setActiveResizeId(null);
           }
         }}
         onPointerMove={(e) => {
-          if (!dragRef.current) return;
           const p = imagePoint(e);
           if (!p) return;
-          moveJoint(dragRef.current, p.x, p.y);
+
+          if (dragRef.current) {
+            if (dragRef.current.type === "move") {
+              moveJoint(dragRef.current.jointId, p.x, p.y);
+            } else if (dragRef.current.type === "resize") {
+              const d = Math.hypot(p.x - dragRef.current.centerX, p.y - dragRef.current.centerY);
+              const newThickness = Math.max(6, Math.min(180, Math.round(d)));
+              updateJoint(dragRef.current.jointId, { thickness: newThickness });
+            }
+            return;
+          }
+
+          if (mode === "bones" && pinMode !== "pin") {
+            const hit = hitJoint(p.x, p.y);
+            if (hit) {
+              setCanvasCursor(hit.type === "resize" ? "ew-resize" : "move");
+            } else {
+              setCanvasCursor("default");
+            }
+          } else {
+            setCanvasCursor(pinMode === "pin" ? "crosshair" : "default");
+          }
         }}
         onPointerUp={() => {
           dragRef.current = null;
+          setActiveResizeId(null);
         }}
       />
     </div>
   );
+}
+
+function drawRotationCrosshair(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  thickness: number,
+  isSelected: boolean,
+  isPin: boolean,
+  isResizing: boolean = false,
+  label?: string,
+) {
+  const t = Math.max(8, thickness);
+  const r1 = Math.round(t * 0.5);
+  const r2 = Math.round(t);
+  const r3 = Math.round(t * 1.5);
+  const crossExtent = r3 + 8;
+
+  ctx.save();
+  ctx.lineWidth = 1;
+
+  // 1. Concentric circles with 1px crisp strokes
+  // Outer circle (overlap margin): 1.5x thickness
+  ctx.beginPath();
+  ctx.arc(x, y, r3, 0, Math.PI * 2);
+  ctx.strokeStyle = isSelected
+    ? "rgba(99, 246, 255, 0.45)"
+    : "rgba(241, 236, 228, 0.2)";
+  ctx.setLineDash([3, 3]);
+  ctx.stroke();
+
+  // Middle circle (joint socket / cut line): 1.0x thickness - Draggable for size change!
+  ctx.beginPath();
+  ctx.arc(x, y, r2, 0, Math.PI * 2);
+  ctx.strokeStyle = isResizing
+    ? "#ffc53d"
+    : isSelected
+    ? "#63f6ff"
+    : isPin
+    ? "#ff5f9e"
+    : "rgba(241, 236, 228, 0.6)";
+  ctx.lineWidth = isResizing ? 2.5 : isSelected ? 1.8 : 1.0;
+  ctx.setLineDash([]);
+  ctx.stroke();
+
+  // Inner core circle: 0.5x thickness
+  ctx.beginPath();
+  ctx.arc(x, y, r1, 0, Math.PI * 2);
+  ctx.strokeStyle = isSelected
+    ? "rgba(99, 246, 255, 0.65)"
+    : "rgba(241, 236, 228, 0.3)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // 2. 1px crosshairs extending horizontally and vertically through rotation point
+  ctx.beginPath();
+  // Horizontal crosshair
+  ctx.moveTo(x - crossExtent, y);
+  ctx.lineTo(x + crossExtent, y);
+  // Vertical crosshair
+  ctx.moveTo(x, y - crossExtent);
+  ctx.lineTo(x, y + crossExtent);
+  ctx.strokeStyle = isSelected
+    ? "rgba(99, 246, 255, 0.9)"
+    : isPin
+    ? "rgba(255, 95, 158, 0.9)"
+    : "rgba(241, 236, 228, 0.65)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // 3. Central rotation pivot pin (draggable for moving position)
+  ctx.beginPath();
+  ctx.arc(x, y, isSelected || isPin ? 4 : 3, 0, Math.PI * 2);
+  ctx.fillStyle = isSelected ? "#63f6ff" : isPin ? "#ff5f9e" : "#f1ece4";
+  ctx.fill();
+  ctx.strokeStyle = "#0d0c0b";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // 4. Draggable resize handles on the middle socket circle
+  if (isSelected || isResizing) {
+    const handleAngles = [0, Math.PI * 0.5, Math.PI, Math.PI * 1.5];
+    for (let i = 0; i < handleAngles.length; i++) {
+      const a = handleAngles[i];
+      const hx = x + r2 * Math.cos(a);
+      const hy = y + r2 * Math.sin(a);
+      ctx.beginPath();
+      ctx.arc(hx, hy, i === 0 ? 5 : 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = isResizing ? "#ffc53d" : "#63f6ff";
+      ctx.fill();
+      ctx.strokeStyle = "#0d0c0b";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+  }
+
+  // 5. Dynamic label with live radius
+  if (label && (isSelected || isPin || isResizing)) {
+    ctx.font = "600 12px Outfit, sans-serif";
+    ctx.fillStyle = isResizing ? "#ffc53d" : isSelected ? "#63f6ff" : "#f1ece4";
+    ctx.strokeStyle = "rgba(13,12,11,0.9)";
+    ctx.lineWidth = 3;
+    const text = isResizing
+      ? `${label} • R: ${r2}px (drag circle to resize)`
+      : `${label} (R: ${r2}px)`;
+    ctx.strokeText(text, x + crossExtent + 6, y - 4);
+    ctx.fillText(text, x + crossExtent + 6, y - 4);
+  }
+
+  ctx.restore();
 }
 
 function drawBones(
@@ -273,39 +476,25 @@ function drawBones(
   joints: Joint[],
   selectedId: string | null,
   pinId: string | null,
+  activeResizeId: string | null = null,
 ) {
-  const byId = new Map(joints.map((j) => [j.id, j]));
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-  for (const joint of joints) {
-    if (!joint.parentId) continue;
-    const parent = byId.get(joint.parentId);
-    if (!parent) continue;
-    ctx.strokeStyle = "rgba(217, 210, 197, 0.55)";
-    ctx.lineWidth = 2.4;
-    ctx.beginPath();
-    ctx.moveTo(parent.x, parent.y);
-    ctx.lineTo(joint.x, joint.y);
-    ctx.stroke();
-  }
+  // Respecting "No bones etc anywhere":
+  // We draw the pristine rotation crosshairs with draggable concentric joint circles,
+  // without cluttering bone linkage sticks across the character artwork.
   for (const joint of joints) {
     const selected = joint.id === selectedId;
     const pin = joint.id === pinId;
-    ctx.beginPath();
-    ctx.arc(joint.x, joint.y, selected || pin ? 7.5 : 5.5, 0, Math.PI * 2);
-    ctx.fillStyle = pin ? "#f1ece4" : selected ? "#d9d2c5" : "#c4b8a5";
-    ctx.fill();
-    ctx.lineWidth = 1.5;
-    ctx.strokeStyle = "#0d0c0b";
-    ctx.stroke();
-    if (selected || pin) {
-      ctx.font = "600 13px Outfit, sans-serif";
-      ctx.fillStyle = "#f1ece4";
-      ctx.strokeStyle = "rgba(13,12,11,0.7)";
-      ctx.lineWidth = 3;
-      ctx.strokeText(joint.label, joint.x + 10, joint.y - 10);
-      ctx.fillText(joint.label, joint.x + 10, joint.y - 10);
-    }
+    const isResizing = joint.id === activeResizeId;
+    drawRotationCrosshair(
+      ctx,
+      joint.x,
+      joint.y,
+      joint.thickness,
+      selected,
+      pin,
+      isResizing,
+      joint.label,
+    );
   }
 }
 
@@ -324,8 +513,19 @@ export function PartTiles({ attachments }: { attachments: Attachment[] }) {
             selectedId === part.boneId ? "ring-2 ring-accent" : "hover:bg-elevated/80"
           )}
         >
-          <div className="checker-tile relative aspect-square overflow-hidden rounded-sm">
+          <div className="checker-tile relative aspect-square overflow-hidden rounded-sm group">
             <img src={part.dataUrl} alt={part.label} className="h-full w-full object-contain" />
+            <div
+              className="absolute bottom-1 right-1 p-1 rounded bg-black/70 hover:bg-accent text-white opacity-80 hover:opacity-100 transition-all cursor-pointer"
+              onClick={(e) => {
+                e.stopPropagation();
+                useStudio.getState().setBrush({ enabled: true, attachmentId: part.id });
+              }}
+              title={`Edit mask for ${part.label}`}
+              role="button"
+            >
+              <Paintbrush className="size-3" />
+            </div>
           </div>
           <span className={selectedId === part.boneId ? "truncate text-xs text-fg" : "truncate text-xs text-muted"}>
             {part.label}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildCutSegments, buildGeodesicOwnership, buildConstrainedOwnership } from "./cut-parts";
-import { applyMaskEdits } from "./mask-utils";
+import { applyMaskEdits, ensureSmoothMask } from "./mask-utils";
 import { buildFigureMask, detectBackground } from "./image";
 const g = globalThis as typeof globalThis & { ImageData?: any };
 
@@ -145,3 +145,52 @@ test("attachment mask edits can add and erase localized repair strokes", () => {
   assert.equal(repaired[4 * width + 6], 255);
   assert.equal(repaired[4 * width + 5], 0);
 });
+
+test("hips segment bounds and geometry group the hip circle and both leg start circles", () => {
+  const joints = [
+    { id: "hips", parentId: null, x: 50, y: 50, thickness: 15, label: "Hips" },
+    { id: "hip_l", parentId: "hips", x: 40, y: 60, thickness: 12, label: "Left Hip" },
+    { id: "hip_r", parentId: "hips", x: 60, y: 60, thickness: 12, label: "Right Hip" },
+    { id: "knee_l", parentId: "hip_l", x: 40, y: 80, thickness: 10, label: "Left Knee" },
+    { id: "knee_r", parentId: "hip_r", x: 60, y: 80, thickness: 10, label: "Right Knee" },
+  ];
+  const segs = buildCutSegments(joints);
+  const hipSeg = segs.find((s) => s.joint.id === "hips");
+  assert.ok(hipSeg, "hips segment should exist");
+
+  // Hips segment should span from above the hip joint down past the leg start circles
+  assert.ok(hipSeg.minX !== undefined && hipSeg.minX <= 40 - 12, "hips segment contains left hip circle");
+  assert.ok(hipSeg.maxX !== undefined && hipSeg.maxX >= 60 + 12, "hips segment contains right hip circle");
+  assert.ok(hipSeg.maxY !== undefined && hipSeg.maxY >= 60 + 12, "hips segment contains bottom of leg start circles");
+  assert.ok(hipSeg.isHip, "hip segment is marked as hip");
+  assert.equal(hipSeg.legStarts?.length, 2, "hip segment has 2 leg starts");
+});
+
+test("ensureSmoothMask completely purges 1px hangs and fills 1px holes", () => {
+  const width = 11;
+  const height = 11;
+  const mask = new Uint8Array(width * height);
+
+  // Create a 5x5 solid square in the center
+  for (let y = 3; y <= 7; y++) {
+    for (let x = 3; x <= 7; x++) {
+      mask[y * width + x] = 255;
+    }
+  }
+
+  // Add 1px hang / spur sticking out from (5, 7) down to (5, 8) and (5, 9)
+  mask[8 * width + 5] = 255;
+  mask[9 * width + 5] = 255; // 1px hang whisker tip!
+
+  // Add a 1px pinhole in the center (5, 5)
+  mask[5 * width + 5] = 0;
+
+  const smoothed = ensureSmoothMask(mask, width, height, 5, 5);
+
+  // 1px hang at (5, 9) must be purged (0)
+  assert.equal(smoothed[9 * width + 5], 0, "1px hang whisker tip must be purged");
+
+  // 1px pinhole at (5, 5) must be filled (255)
+  assert.equal(smoothed[5 * width + 5], 255, "1px interior pinhole must be filled");
+});
+

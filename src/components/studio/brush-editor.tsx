@@ -1,7 +1,19 @@
-import React, { useRef, useEffect, useState, useCallback } from "react";
+import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { useStudio } from "@/lib/puppet/store";
-import { applyMaskEdits, MaskEdit, MaskEditMode } from "@/lib/puppet/mask-utils";
+import {
+  applyMaskEdits,
+  MaskEdit,
+  MaskEditMode,
+  CrosshairPoint,
+  snapToCrosshairsAndCircles,
+  cleanDanglingPixels,
+  applySocketCap,
+  ensureSmoothMask,
+  SnapResult,
+} from "@/lib/puppet/mask-utils";
 import { loadHtmlImage } from "@/lib/puppet/image";
+import { clearImageCache } from "@/components/studio/stage-canvas";
+import { toast } from "sonner";
 import {
   Paintbrush,
   Eraser,
@@ -11,20 +23,34 @@ import {
   Check,
   X,
   Sparkles,
+  ZoomIn,
+  ZoomOut,
+  Crosshair,
+  Magnet,
+  Maximize2,
+  ShieldAlert,
+  Wand2,
 } from "lucide-react";
 
 export function BrushEditor() {
-  const { brush, attachments, source, saveAttachmentCut, setBrush } = useStudio();
+  const { brush, attachments, source, joints, saveAttachmentCut, setBrush } = useStudio();
+  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const attachment = attachments.find((a) => a.id === brush.attachmentId);
 
   const [isLoading, setIsLoading] = useState(true);
   const [mode, setMode] = useState<MaskEditMode>("add");
-  const [radius, setRadius] = useState<number>(brush.radius || 20);
+  const [radius, setRadius] = useState<number>(brush.radius || 18);
+  const [zoom, setZoom] = useState<number>(2.5);
+  const [snapEnabled, setSnapEnabled] = useState<boolean>(true);
+  const [showCrosshairs, setShowCrosshairs] = useState<boolean>(true);
   const [history, setHistory] = useState<Uint8Array[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [isDrawing, setIsDrawing] = useState(false);
+  const [snapStatus, setSnapStatus] = useState<SnapResult | null>(null);
+
   const [brushCursor, setBrushCursor] = useState<{
     x: number;
     y: number;
@@ -36,8 +62,83 @@ export function BrushEditor() {
   const activeMaskRef = useRef<Uint8Array | null>(null);
   const lastPosRef = useRef<{ x: number; y: number } | null>(null);
 
-  // Redraw canvas with base image + mask overlay
-  const renderCanvas = useCallback(() => {
+  // Compute rotation points (parent pivot + child joint pivots) for this attachment
+  const crosshairPoints: CrosshairPoint[] = useMemo(() => {
+    if (!attachment) return [];
+    const points: CrosshairPoint[] = [];
+
+    // 1. Primary rotation point (parent pivot hinge)
+    const p1Thickness = Math.max(8, attachment.thickness || 20);
+    points.push({
+      x: attachment.localPivotX,
+      y: attachment.localPivotY,
+      radii: [
+        Math.round(p1Thickness * 0.5),
+        Math.round(p1Thickness),
+        Math.round(p1Thickness * 1.5),
+      ],
+      label: "Hinge Pivot",
+      isParent: true,
+    });
+
+    // 2. Child rotation points (distal hinges, e.g. elbow, knee, wrist)
+    const childJoints = joints.filter((j) => j.parentId === attachment.boneId);
+    for (const cj of childJoints) {
+      const childLocalX = cj.x - attachment.cropX;
+      const childLocalY = cj.y - attachment.cropY;
+      const cThickness = Math.max(8, cj.thickness || 16);
+      points.push({
+        x: childLocalX,
+        y: childLocalY,
+        radii: [
+          Math.round(cThickness * 0.5),
+          Math.round(cThickness),
+          Math.round(cThickness * 1.5),
+        ],
+        label: cj.label || "Distal Hinge",
+        isParent: false,
+      });
+    }
+
+    return points;
+  }, [attachment, joints]);
+
+  // Compute optimal scale between crosshairs
+  const computeCrosshairFitScale = useCallback(() => {
+    if (!attachment || !containerRef.current) return 3.0;
+    const rect = containerRef.current.getBoundingClientRect();
+    const viewW = Math.max(300, rect.width - 64);
+    const viewH = Math.max(300, rect.height - 64);
+
+    if (crosshairPoints.length >= 2) {
+      // Scale between both crosshairs
+      const p1 = crosshairPoints[0];
+      const p2 = crosshairPoints[1];
+      const maxR = Math.max(p1.radii[2] || 25, p2.radii[2] || 25);
+      const minX = Math.min(p1.x, p2.x) - maxR * 1.4;
+      const maxX = Math.max(p1.x, p2.x) + maxR * 1.4;
+      const minY = Math.min(p1.y, p2.y) - maxR * 1.4;
+      const maxY = Math.max(p1.y, p2.y) + maxR * 1.4;
+      const spanW = Math.max(40, maxX - minX);
+      const spanH = Math.max(40, maxY - minY);
+
+      const targetScale = Math.min(viewW / spanW, viewH / spanH);
+      return Math.min(7.0, Math.max(1.8, Number(targetScale.toFixed(2))));
+    } else if (crosshairPoints.length === 1) {
+      // Scale appropriately for single crosshair & part
+      const p1 = crosshairPoints[0];
+      const radiusMargin = Math.max(p1.radii[2] * 2.2, attachment.width * 0.5, attachment.height * 0.5);
+      const span = radiusMargin * 2;
+      const targetScale = Math.min(viewW / span, viewH / span);
+      return Math.min(7.0, Math.max(2.2, Number(targetScale.toFixed(2))));
+    } else {
+      const targetScale = Math.min(viewW / attachment.width, viewH / attachment.height);
+      return Math.min(6.0, Math.max(1.5, Number(targetScale.toFixed(2))));
+    }
+  }, [attachment, crosshairPoints]);
+
+  // Redraw the base mask canvas (pixel-level mask)
+  const renderMaskCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     const baseImg = baseImgRef.current;
     const mask = activeMaskRef.current;
@@ -50,14 +151,14 @@ export function BrushEditor() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // 1. Draw crisp dark checkerboard pattern background
-    const tileSize = 12;
+    // 1. Draw crisp dark checkerboard pattern
+    const tileSize = 10;
     for (let y = 0; y < h; y += tileSize) {
       for (let x = 0; x < w; x += tileSize) {
         ctx.fillStyle =
           (Math.floor(x / tileSize) + Math.floor(y / tileSize)) % 2 === 0
-            ? "#151515"
-            : "#222222";
+            ? "#141414"
+            : "#202020";
         ctx.fillRect(x, y, tileSize, tileSize);
       }
     }
@@ -74,9 +175,8 @@ export function BrushEditor() {
     const d = imgData.data;
 
     // Mask visualization:
-    // mask[i] > 0: KEPT (this is the cut part). Full vivid original color!
-    // mask[i] === 0: CUT OUT. Soft dimmed translucent red wash so the user sees
-    // where the rest of the figure is, making it easy to brush pixels back!
+    // mask[i] > 0: KEPT (vivid original color)
+    // mask[i] === 0: CUT OUT (ghosted translucent red wash)
     for (let i = 0; i < mask.length; i++) {
       const m = mask[i];
       const idx = i * 4;
@@ -84,37 +184,164 @@ export function BrushEditor() {
       if (origA === 0) continue;
 
       if (m === 0) {
-        // Ghosted red wash for cut-away pixels
-        d[idx] = Math.min(255, Math.floor(d[idx] * 0.4 + 160));
-        d[idx + 1] = Math.floor(d[idx + 1] * 0.25);
-        d[idx + 2] = Math.floor(d[idx + 2] * 0.25);
-        d[idx + 3] = Math.floor(origA * 0.35);
+        d[idx] = Math.min(255, Math.floor(d[idx] * 0.4 + 175));
+        d[idx + 1] = Math.floor(d[idx + 1] * 0.22);
+        d[idx + 2] = Math.floor(d[idx + 2] * 0.22);
+        d[idx + 3] = Math.floor(origA * 0.38);
       }
-      // If m > 0, leave full original color and opacity intact
     }
     offCtx.putImageData(imgData, 0, 0);
 
-    // 3. Draw composited figure onto main canvas
+    // 3. Draw onto main mask canvas
     ctx.drawImage(offscreen, 0, 0);
+  }, [attachment]);
 
-    // 4. Draw brush cursor ring if pointer is over canvas
+  // Redraw the crisp high-resolution overlay canvas (1px crosshairs, concentric circles, snap markers)
+  const renderOverlayCanvas = useCallback(() => {
+    const overlay = overlayCanvasRef.current;
+    if (!overlay || !attachment) return;
+
+    const displayW = Math.round(attachment.width * zoom);
+    const displayH = Math.round(attachment.height * zoom);
+
+    if (overlay.width !== displayW || overlay.height !== displayH) {
+      overlay.width = displayW;
+      overlay.height = displayH;
+    }
+
+    const ctx = overlay.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, displayW, displayH);
+
+    // 1. Draw 1px crosshairs & concentric circles at rotation points
+    if (showCrosshairs) {
+      for (const pt of crosshairPoints) {
+        const sx = pt.x * zoom;
+        const sy = pt.y * zoom;
+        const r1 = pt.radii[0] * zoom;
+        const r2 = pt.radii[1] * zoom;
+        const r3 = pt.radii[2] * zoom;
+        const crossExtent = r3 + 14;
+
+        ctx.save();
+        ctx.lineWidth = 1;
+
+        // Outer concentric circle (overlap zone: 1.5x)
+        ctx.beginPath();
+        ctx.arc(sx, sy, r3, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(99, 246, 255, 0.35)";
+        ctx.setLineDash([3, 3]);
+        ctx.stroke();
+
+        // Middle concentric circle (hinge socket line: 1.0x thickness)
+        ctx.beginPath();
+        ctx.arc(sx, sy, r2, 0, Math.PI * 2);
+        ctx.strokeStyle = pt.isParent ? "#63f6ff" : "#ffd166";
+        ctx.setLineDash([]);
+        ctx.stroke();
+
+        // Inner core circle (0.5x)
+        ctx.beginPath();
+        ctx.arc(sx, sy, r1, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+        ctx.stroke();
+
+        // Crisp 1px horizontal and vertical crosshairs
+        ctx.beginPath();
+        ctx.moveTo(Math.round(sx - crossExtent) + 0.5, Math.round(sy) + 0.5);
+        ctx.lineTo(Math.round(sx + crossExtent) + 0.5, Math.round(sy) + 0.5);
+        ctx.moveTo(Math.round(sx) + 0.5, Math.round(sy - crossExtent) + 0.5);
+        ctx.lineTo(Math.round(sx) + 0.5, Math.round(sy + crossExtent) + 0.5);
+        ctx.strokeStyle = pt.isParent ? "rgba(99, 246, 255, 0.85)" : "rgba(255, 209, 102, 0.85)";
+        ctx.stroke();
+
+        // Center reticle point
+        ctx.beginPath();
+        ctx.arc(sx, sy, 3, 0, Math.PI * 2);
+        ctx.fillStyle = pt.isParent ? "#63f6ff" : "#ffd166";
+        ctx.fill();
+        ctx.strokeStyle = "#000000";
+        ctx.stroke();
+
+        // Label with radius info
+        ctx.font = "600 11px Outfit, sans-serif";
+        ctx.fillStyle = pt.isParent ? "#63f6ff" : "#ffd166";
+        ctx.strokeStyle = "rgba(0,0,0,0.8)";
+        ctx.lineWidth = 3;
+        const text = `${pt.label} (R:${pt.radii[1]}px)`;
+        ctx.strokeText(text, sx + crossExtent + 4, sy + 3);
+        ctx.fillText(text, sx + crossExtent + 4, sy + 3);
+
+        ctx.restore();
+      }
+    }
+
+    // 2. Active Snap Visual Feedback (highlights snapped circle or axis in vibrant glow)
+    if (snapStatus?.snapped && snapStatus.targetPoint) {
+      const pt = snapStatus.targetPoint;
+      const sx = pt.x * zoom;
+      const sy = pt.y * zoom;
+
+      ctx.save();
+      if (snapStatus.type === "circle" && snapStatus.targetRadius) {
+        const sr = snapStatus.targetRadius * zoom;
+        ctx.beginPath();
+        ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+        ctx.strokeStyle = "#ffe600";
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = "#ffe600";
+        ctx.shadowBlur = 8;
+        ctx.stroke();
+      } else if (snapStatus.type === "axis") {
+        ctx.beginPath();
+        if (Math.abs(snapStatus.x - pt.x) < 0.01) {
+          ctx.moveTo(Math.round(sx) + 0.5, 0);
+          ctx.lineTo(Math.round(sx) + 0.5, displayH);
+        } else {
+          ctx.moveTo(0, Math.round(sy) + 0.5);
+          ctx.lineTo(displayW, Math.round(sy) + 0.5);
+        }
+        ctx.strokeStyle = "#ffe600";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+
+      // Draw snap target reticle
+      const snapScreenX = snapStatus.x * zoom;
+      const snapScreenY = snapStatus.y * zoom;
+      ctx.beginPath();
+      ctx.arc(snapScreenX, snapScreenY, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffe600";
+      ctx.fill();
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    // 3. Brush cursor ring
     if (brushCursor) {
+      const bx = brushCursor.x * zoom;
+      const by = brushCursor.y * zoom;
+      const br = brushCursor.radius * zoom;
+
       ctx.save();
       ctx.beginPath();
-      ctx.arc(brushCursor.x, brushCursor.y, brushCursor.radius, 0, Math.PI * 2);
+      ctx.arc(bx, by, br, 0, Math.PI * 2);
       ctx.strokeStyle = brushCursor.mode === "add" ? "#63f6ff" : "#ff5f9e";
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 1.5;
       ctx.stroke();
 
       ctx.fillStyle = brushCursor.mode === "add" ? "#63f6ff" : "#ff5f9e";
       ctx.beginPath();
-      ctx.arc(brushCursor.x, brushCursor.y, 1.5, 0, Math.PI * 2);
+      ctx.arc(bx, by, 2, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
     }
-  }, [attachment, brushCursor]);
+  }, [attachment, zoom, showCrosshairs, crosshairPoints, snapStatus, brushCursor]);
 
-  // Load base image and initial mask when modal opens
+  // Load images and initialize mask
   useEffect(() => {
     if (!brush.enabled || !attachment) {
       baseImgRef.current = null;
@@ -132,29 +359,17 @@ export function BrushEditor() {
       const { width: w, height: h } = attachment;
 
       try {
-        // Step 1: Resolve the base image (raw unmasked figure crop)
         let baseImg: HTMLImageElement;
         if (attachment.baseDataUrl) {
           baseImg = await loadHtmlImage(attachment.baseDataUrl);
         } else if (source?.dataUrl) {
-          // Crop base figure directly from full source image
           const srcImg = await loadHtmlImage(source.dataUrl);
           const c = document.createElement("canvas");
           c.width = w;
           c.height = h;
           const cCtx = c.getContext("2d");
           if (cCtx) {
-            cCtx.drawImage(
-              srcImg,
-              attachment.cropX,
-              attachment.cropY,
-              w,
-              h,
-              0,
-              0,
-              w,
-              h,
-            );
+            cCtx.drawImage(srcImg, attachment.cropX, attachment.cropY, w, h, 0, 0, w, h);
             baseImg = await loadHtmlImage(c.toDataURL("image/png"));
           } else {
             baseImg = await loadHtmlImage(attachment.dataUrl);
@@ -166,12 +381,8 @@ export function BrushEditor() {
         if (isCancelled) return;
         baseImgRef.current = baseImg;
 
-        // Step 2: Resolve the mask array
         let initialMask: Uint8Array;
-        if (
-          attachment.mask.pixelMask &&
-          attachment.mask.pixelMask.length === w * h
-        ) {
+        if (attachment.mask.pixelMask && attachment.mask.pixelMask.length === w * h) {
           initialMask = new Uint8Array(attachment.mask.pixelMask);
         } else if (attachment.mask.alphaPngDataUrl) {
           const alphaImg = await loadHtmlImage(attachment.mask.alphaPngDataUrl);
@@ -197,6 +408,11 @@ export function BrushEditor() {
         activeMaskRef.current = initialMask;
         setHistory([initialMask]);
         setHistoryIndex(0);
+
+        // Auto-scale between crosshairs
+        const idealScale = computeCrosshairFitScale();
+        setZoom(idealScale);
+
         setIsLoading(false);
       } catch (err) {
         console.error("BrushEditor: Failed to load part images", err);
@@ -209,48 +425,75 @@ export function BrushEditor() {
     return () => {
       isCancelled = true;
     };
-  }, [brush.enabled, brush.attachmentId, attachment, source?.dataUrl]);
+  }, [brush.enabled, brush.attachmentId, attachment, source?.dataUrl, computeCrosshairFitScale]);
 
-  // Redraw when ready or cursor moves
+  // Center scroll position on crosshairs after loading
+  useEffect(() => {
+    if (!isLoading && containerRef.current && crosshairPoints.length > 0 && attachment) {
+      const container = containerRef.current;
+      let targetX = attachment.width / 2;
+      let targetY = attachment.height / 2;
+
+      if (crosshairPoints.length >= 2) {
+        targetX = (crosshairPoints[0].x + crosshairPoints[1].x) / 2;
+        targetY = (crosshairPoints[0].y + crosshairPoints[1].y) / 2;
+      } else if (crosshairPoints.length === 1) {
+        targetX = crosshairPoints[0].x;
+        targetY = crosshairPoints[0].y;
+      }
+
+      const screenX = targetX * zoom;
+      const screenY = targetY * zoom;
+      container.scrollLeft = screenX - container.clientWidth / 2;
+      container.scrollTop = screenY - container.clientHeight / 2;
+    }
+  }, [isLoading, zoom, crosshairPoints, attachment]);
+
+  // Redraw canvases
   useEffect(() => {
     if (!isLoading && activeMaskRef.current && baseImgRef.current) {
-      renderCanvas();
+      renderMaskCanvas();
+      renderOverlayCanvas();
     }
-  }, [isLoading, renderCanvas]);
+  }, [isLoading, renderMaskCanvas, renderOverlayCanvas]);
 
-  // Get canvas-local coordinates scaled to actual mask pixels
+  // Coordinate resolution with precision snapping
   const getCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas || !attachment) return null;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = attachment.width / rect.width;
-    const scaleY = attachment.height / rect.height;
-    return {
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top) * scaleY,
-    };
+    const overlay = overlayCanvasRef.current;
+    if (!overlay || !attachment) return null;
+    const rect = overlay.getBoundingClientRect();
+    const rawX = (e.clientX - rect.left) / zoom;
+    const rawY = (e.clientY - rect.top) / zoom;
+
+    // Apply 1px crosshair circle & axis snapping if enabled
+    if (snapEnabled && crosshairPoints.length > 0) {
+      const snap = snapToCrosshairsAndCircles(rawX, rawY, crosshairPoints, 12 / zoom);
+      return {
+        x: snap.snapped ? snap.x : rawX,
+        y: snap.snapped ? snap.y : rawY,
+        snap,
+      };
+    }
+
+    return { x: rawX, y: rawY, snap: { x: rawX, y: rawY, snapped: false } as SnapResult };
   };
 
-  // Brush stroke processing
+  // Pointer interactions for drawing
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const coords = getCanvasCoords(e);
     if (!coords || !attachment || !activeMaskRef.current) return;
 
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     setIsDrawing(true);
-    lastPosRef.current = coords;
+    lastPosRef.current = { x: coords.x, y: coords.y };
+    setSnapStatus(coords.snap);
 
-    // Apply first dot
     const edits: MaskEdit[] = [{ x: coords.x, y: coords.y, radius, mode }];
-    const nextMask = applyMaskEdits(
-      activeMaskRef.current,
-      attachment.width,
-      attachment.height,
-      edits,
-    );
+    const nextMask = applyMaskEdits(activeMaskRef.current, attachment.width, attachment.height, edits);
     activeMaskRef.current = nextMask;
     setBrushCursor({ x: coords.x, y: coords.y, radius, mode });
-    renderCanvas();
+    renderMaskCanvas();
+    renderOverlayCanvas();
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -258,15 +501,16 @@ export function BrushEditor() {
     if (!coords || !attachment) return;
 
     setBrushCursor({ x: coords.x, y: coords.y, radius, mode });
+    setSnapStatus(coords.snap);
 
     if (!isDrawing || !activeMaskRef.current) {
-      renderCanvas();
+      renderOverlayCanvas();
       return;
     }
 
-    const last = lastPosRef.current ?? coords;
+    const last = lastPosRef.current ?? { x: coords.x, y: coords.y };
     const dist = Math.hypot(coords.x - last.x, coords.y - last.y);
-    const stepSize = Math.max(1, radius * 0.3);
+    const stepSize = Math.max(1, radius * 0.25);
     const steps = Math.ceil(dist / stepSize);
 
     const edits: MaskEdit[] = [];
@@ -281,15 +525,11 @@ export function BrushEditor() {
     }
 
     if (edits.length > 0) {
-      const nextMask = applyMaskEdits(
-        activeMaskRef.current,
-        attachment.width,
-        attachment.height,
-        edits,
-      );
+      const nextMask = applyMaskEdits(activeMaskRef.current, attachment.width, attachment.height, edits);
       activeMaskRef.current = nextMask;
-      lastPosRef.current = coords;
-      renderCanvas();
+      lastPosRef.current = { x: coords.x, y: coords.y };
+      renderMaskCanvas();
+      renderOverlayCanvas();
     }
   };
 
@@ -304,7 +544,6 @@ export function BrushEditor() {
       /* ignore */
     }
 
-    // Save stroke to history
     if (activeMaskRef.current) {
       const newHistory = history.slice(0, historyIndex + 1);
       newHistory.push(new Uint8Array(activeMaskRef.current));
@@ -315,9 +554,19 @@ export function BrushEditor() {
 
   const handlePointerLeave = () => {
     setBrushCursor(null);
+    setSnapStatus(null);
     if (!isDrawing) {
-      renderCanvas();
+      renderOverlayCanvas();
     }
+  };
+
+  // Wheel zoom anchored to cursor
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (!containerRef.current) return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.15 : 0.87;
+    const nextZoom = Math.min(8.0, Math.max(0.75, Number((zoom * factor).toFixed(2))));
+    setZoom(nextZoom);
   };
 
   // Undo / Redo
@@ -327,7 +576,8 @@ export function BrushEditor() {
     const prevMask = new Uint8Array(history[nextIdx]);
     activeMaskRef.current = prevMask;
     setHistoryIndex(nextIdx);
-    renderCanvas();
+    renderMaskCanvas();
+    renderOverlayCanvas();
   };
 
   const handleRedo = () => {
@@ -336,7 +586,8 @@ export function BrushEditor() {
     const nextMask = new Uint8Array(history[nextIdx]);
     activeMaskRef.current = nextMask;
     setHistoryIndex(nextIdx);
-    renderCanvas();
+    renderMaskCanvas();
+    renderOverlayCanvas();
   };
 
   const handleReset = () => {
@@ -347,22 +598,123 @@ export function BrushEditor() {
     newHistory.push(initial);
     setHistory(newHistory);
     setHistoryIndex(newHistory.length - 1);
-    renderCanvas();
+    renderMaskCanvas();
+    renderOverlayCanvas();
   };
 
-  // Close without saving
-  const handleClose = () => {
-    setBrush({ enabled: false, attachmentId: null });
+  // --- SMART SHAPING ACTIONS ---
+
+  // 1. Purge isolated dangling debris and specks
+  const handleCleanDanglingPixels = () => {
+    if (!attachment || !activeMaskRef.current) return;
+    const { cleanedMask, removedPixels } = cleanDanglingPixels(
+      activeMaskRef.current,
+      attachment.width,
+      attachment.height,
+      attachment.localPivotX,
+      attachment.localPivotY,
+      40,
+    );
+
+    if (removedPixels === 0) {
+      toast.info("No dangling debris detected on this part");
+      return;
+    }
+
+    activeMaskRef.current = cleanedMask;
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(cleanedMask);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+    renderMaskCanvas();
+    renderOverlayCanvas();
+    toast.success(`Cleaned ${removedPixels} dangling pixels from cut!`);
   };
 
-  // APPLY & SAVE CUT
+  // 2. Add smooth socket cap at the rotation hinge
+  const handleAddSocketCap = () => {
+    if (!attachment || !activeMaskRef.current) return;
+    const radius = Math.round(attachment.thickness || 20);
+    const newMask = applySocketCap(
+      activeMaskRef.current,
+      attachment.width,
+      attachment.height,
+      attachment.localPivotX,
+      attachment.localPivotY,
+      radius,
+      "add",
+    );
+
+    activeMaskRef.current = newMask;
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(newMask);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+    renderMaskCanvas();
+    renderOverlayCanvas();
+    toast.success(`Applied circular socket cap (R:${radius}px) at hinge`);
+  };
+
+  // 3. Trim hinge excess outside socket circle
+  const handleTrimHingeExcess = () => {
+    if (!attachment || !activeMaskRef.current) return;
+    const radius = Math.round(attachment.thickness || 20);
+    const newMask = applySocketCap(
+      activeMaskRef.current,
+      attachment.width,
+      attachment.height,
+      attachment.localPivotX,
+      attachment.localPivotY,
+      radius,
+      "trim_outside",
+    );
+
+    activeMaskRef.current = newMask;
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(newMask);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+    renderMaskCanvas();
+    renderOverlayCanvas();
+    toast.success("Trimmed jagged hinge excess outside socket circle");
+  };
+
+  // 4. Smooth contour edges (purge 1px spurs & ensure actually smooth paths)
+  const handleSmoothContour = () => {
+    if (!attachment || !activeMaskRef.current) return;
+    const newMask = ensureSmoothMask(
+      activeMaskRef.current,
+      attachment.width,
+      attachment.height,
+      attachment.localPivotX,
+      attachment.localPivotY,
+    );
+    activeMaskRef.current = newMask;
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(newMask);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+    renderMaskCanvas();
+    renderOverlayCanvas();
+    toast.success("Contour smoothed: eliminated 1px hangs & irregular edges");
+  };
+
+  // Save changes & close with mandatory pre-save smoothing pass
   const handleSave = () => {
     if (!attachment || !baseImgRef.current || !activeMaskRef.current) return;
     const baseImg = baseImgRef.current;
-    const currentMask = activeMaskRef.current;
     const { width: w, height: h } = attachment;
 
-    // 1. Generate cut image dataUrl (RGBA with alpha mask)
+    // Run smoothing pass before brush save that ensures path is smooth, not 1px hangs but actually smooth
+    const currentMask = ensureSmoothMask(
+      activeMaskRef.current,
+      w,
+      h,
+      attachment.localPivotX,
+      attachment.localPivotY,
+    );
+    activeMaskRef.current = currentMask;
+
     const cutCanvas = document.createElement("canvas");
     cutCanvas.width = w;
     cutCanvas.height = h;
@@ -378,7 +730,7 @@ export function BrushEditor() {
       const m = currentMask[i];
       const idx = i * 4;
       if (m === 0) {
-        d[idx + 3] = 0; // Cut out! Transparent!
+        d[idx + 3] = 0;
       } else {
         d[idx + 3] = Math.min(d[idx + 3] || 255, m);
         if (d[idx + 3] > 8) pixelCount++;
@@ -387,7 +739,6 @@ export function BrushEditor() {
     cutCtx.putImageData(imgData, 0, 0);
     const cutDataUrl = cutCanvas.toDataURL("image/png");
 
-    // 2. Generate alphaPngDataUrl
     const alphaCanvas = document.createElement("canvas");
     alphaCanvas.width = w;
     alphaCanvas.height = h;
@@ -405,56 +756,57 @@ export function BrushEditor() {
     alphaCtx.putImageData(alphaImg, 0, 0);
     const alphaPngDataUrl = alphaCanvas.toDataURL("image/png");
 
-    // 3. Save directly to store
-    saveAttachmentCut(
-      attachment.id,
-      currentMask,
-      cutDataUrl,
-      alphaPngDataUrl,
-      pixelCount,
-    );
+    clearImageCache(attachment.dataUrl);
+    saveAttachmentCut(attachment.id, currentMask, cutDataUrl, alphaPngDataUrl, pixelCount);
+    setBrush({ enabled: false, attachmentId: null });
+    toast.success(`Smoothed & saved refined mask for ${attachment.label}`);
+  };
 
-    // 4. Close brush editor
+  const handleClose = () => {
     setBrush({ enabled: false, attachmentId: null });
   };
 
   if (!brush.enabled || !attachment) return null;
 
-  // Compute suitable display size for canvas
-  const aspect = attachment.width / Math.max(1, attachment.height);
-  let displayWidth = Math.max(260, Math.min(480, attachment.width * 2));
-  let displayHeight = Math.round(displayWidth / aspect);
-  if (displayHeight > 420) {
-    displayHeight = 420;
-    displayWidth = Math.round(displayHeight * aspect);
-  }
+  const displayWidth = Math.round(attachment.width * zoom);
+  const displayHeight = Math.round(attachment.height * zoom);
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6 animate-in fade-in duration-200">
-      <div className="bg-[#0c0c0c] border border-[#2a2a2a] rounded-2xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[92vh] overflow-hidden text-[#f5f5f5]">
+    <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-200 select-none">
+      <div className="bg-[#0c0c0c] border border-[#262626] rounded-2xl shadow-2xl w-full max-w-5xl flex flex-col h-[94vh] overflow-hidden text-[#f5f5f5]">
         {/* Header */}
-        <div className="px-5 py-3.5 border-b border-[#222] flex items-center justify-between bg-[#111]">
+        <div className="px-5 py-3 border-b border-[#222] flex items-center justify-between bg-[#111] shrink-0">
           <div className="flex items-center gap-3">
-            <span className="font-display text-lg font-medium tracking-tight text-white">
-              Edit Mask: {attachment.label}
-            </span>
-            <span className="text-xs font-mono text-[#a3a3a3] bg-[#1a1a1a] px-2 py-0.5 rounded border border-[#333]">
-              {attachment.width}×{attachment.height}px
-            </span>
+            <div className="p-1.5 rounded-lg bg-[#63f6ff]/10 text-[#63f6ff]">
+              <Crosshair className="size-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-display text-base font-semibold tracking-tight text-white">
+                  Precision Brush &amp; Rigging: {attachment.label}
+                </span>
+                <span className="text-[11px] font-mono text-[#a3a3a3] bg-[#1a1a1a] px-2 py-0.5 rounded border border-[#333]">
+                  {attachment.width}×{attachment.height}px
+                </span>
+              </div>
+              <p className="text-[11px] text-[#888]">
+                1px crosshairs &amp; concentric circles at rotation points • Snap enabled
+              </p>
+            </div>
           </div>
           <button
             onClick={handleClose}
-            className="text-[#a3a3a3] hover:text-white p-1 rounded-md hover:bg-[#222] transition-colors"
-            title="Cancel & Close"
+            className="text-[#a3a3a3] hover:text-white p-1.5 rounded-md hover:bg-[#222] transition-colors"
+            title="Close"
           >
             <X className="size-5" />
           </button>
         </div>
 
-        {/* Toolbar */}
-        <div className="px-5 py-3 border-b border-[#222] flex flex-wrap items-center justify-between gap-3 bg-[#141414]">
-          {/* Tool Modes */}
-          <div className="flex items-center gap-2">
+        {/* Primary Controls Toolbar */}
+        <div className="px-5 py-2.5 border-b border-[#222] flex flex-wrap items-center justify-between gap-2.5 bg-[#141414] shrink-0">
+          {/* Brush / Eraser */}
+          <div className="flex items-center gap-1.5">
             <button
               onClick={() => setMode("add")}
               className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all border ${
@@ -462,7 +814,7 @@ export function BrushEditor() {
                   ? "bg-[#63f6ff] border-[#63f6ff] text-[#031012] shadow-md shadow-[#63f6ff]/20"
                   : "bg-[#1f1f1f] border-[#333] text-[#a3a3a3] hover:text-white"
               }`}
-              title="Paint to add figure pixels back"
+              title="Paint to add pixels back"
             >
               <Paintbrush className="size-3.5" />
               Brush (Add)
@@ -474,30 +826,87 @@ export function BrushEditor() {
                   ? "bg-[#ff5f9e] border-[#ff5f9e] text-white shadow-md shadow-[#ff5f9e]/20"
                   : "bg-[#1f1f1f] border-[#333] text-[#a3a3a3] hover:text-white"
               }`}
-              title="Erase to cut out unwanted pixels"
+              title="Erase to cut out dangling debris"
             >
               <Eraser className="size-3.5" />
               Eraser (Cut)
             </button>
           </div>
 
-          {/* Brush Size Slider */}
-          <div className="flex items-center gap-2.5">
+          {/* Brush Size */}
+          <div className="flex items-center gap-2 px-2.5 py-1 bg-[#1a1a1a] rounded-lg border border-[#2b2b2b]">
             <span className="text-xs text-[#a3a3a3] font-medium whitespace-nowrap">
-              Size: {radius}px
+              Radius: {radius}px
             </span>
             <input
               type="range"
               min={3}
-              max={64}
+              max={56}
               value={radius}
               onChange={(e) => setRadius(Number(e.target.value))}
-              className="w-24 sm:w-32 accent-[#63f6ff] cursor-pointer"
+              className="w-20 sm:w-28 accent-[#63f6ff] cursor-pointer"
             />
           </div>
 
-          {/* History Controls */}
+          {/* Snapping & Crosshairs Toggles */}
           <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => setSnapEnabled(!snapEnabled)}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all border ${
+                snapEnabled
+                  ? "bg-[#ffe600]/15 border-[#ffe600]/50 text-[#ffe600]"
+                  : "bg-[#1a1a1a] border-[#333] text-[#888] hover:text-white"
+              }`}
+              title="Snap brush and cut strokes to rotation point circles and axes"
+            >
+              <Magnet className="size-3.5" />
+              Snap {snapEnabled ? "ON" : "OFF"}
+            </button>
+
+            <button
+              onClick={() => setShowCrosshairs(!showCrosshairs)}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all border ${
+                showCrosshairs
+                  ? "bg-[#63f6ff]/15 border-[#63f6ff]/40 text-[#63f6ff]"
+                  : "bg-[#1a1a1a] border-[#333] text-[#888] hover:text-white"
+              }`}
+              title="Toggle 1px rotation point crosshairs and concentric circles"
+            >
+              <Crosshair className="size-3.5" />
+              Crosshairs
+            </button>
+          </div>
+
+          {/* Scale & Zoom Controls */}
+          <div className="flex items-center gap-1 bg-[#1a1a1a] px-2 py-1 rounded-lg border border-[#2b2b2b]">
+            <button
+              onClick={() => setZoom(Math.max(0.75, Number((zoom - 0.5).toFixed(1))))}
+              className="p-1 rounded text-[#a3a3a3] hover:text-white hover:bg-[#282828]"
+              title="Zoom Out"
+            >
+              <ZoomOut className="size-3.5" />
+            </button>
+            <span className="text-xs font-mono font-medium text-white px-1">
+              {Math.round(zoom * 100)}%
+            </span>
+            <button
+              onClick={() => setZoom(Math.min(8.0, Number((zoom + 0.5).toFixed(1))))}
+              className="p-1 rounded text-[#a3a3a3] hover:text-white hover:bg-[#282828]"
+              title="Zoom In"
+            >
+              <ZoomIn className="size-3.5" />
+            </button>
+            <button
+              onClick={() => setZoom(computeCrosshairFitScale())}
+              className="px-2 py-0.5 text-[11px] rounded bg-[#282828] text-[#a3a3a3] hover:text-white ml-1 font-medium"
+              title="Scale between both rotation crosshairs"
+            >
+              Fit Crosshairs
+            </button>
+          </div>
+
+          {/* History */}
+          <div className="flex items-center gap-1">
             <button
               onClick={handleUndo}
               disabled={historyIndex <= 0}
@@ -516,7 +925,7 @@ export function BrushEditor() {
             </button>
             <button
               onClick={handleReset}
-              className="p-1.5 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] transition-colors ml-1"
+              className="p-1.5 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] transition-colors"
               title="Reset to Original Cut"
             >
               <RotateCcw className="size-4" />
@@ -524,22 +933,99 @@ export function BrushEditor() {
           </div>
         </div>
 
-        {/* Canvas Area */}
-        <div className="flex-1 min-h-[300px] flex items-center justify-center p-6 bg-[#080808] overflow-auto select-none relative">
+        {/* Smart Shaping & Debris Bar */}
+        <div className="px-5 py-2 border-b border-[#222] flex flex-wrap items-center justify-between gap-2 bg-[#0e0e0e] shrink-0 text-xs">
+          <div className="flex items-center gap-1.5 text-[#a3a3a3]">
+            <Sparkles className="size-3.5 text-[#63f6ff]" />
+            <span className="font-medium text-white">Smart Shaping:</span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={handleCleanDanglingPixels}
+              className="px-2.5 py-1 rounded-md bg-[#231a28] hover:bg-[#34243d] text-[#ff80bf] border border-[#ff80bf]/30 flex items-center gap-1.5 font-medium transition-colors"
+              title="Purge isolated dangling debris and disconnected scraps"
+            >
+              <Wand2 className="size-3.5" />
+              Clean Dangling Debris
+            </button>
+
+            <button
+              onClick={handleAddSocketCap}
+              className="px-2.5 py-1 rounded-md bg-[#16272b] hover:bg-[#203a40] text-[#63f6ff] border border-[#63f6ff]/30 flex items-center gap-1.5 font-medium transition-colors"
+              title="Generate a clean circular hinge socket cap at rotation point"
+            >
+              <ShieldAlert className="size-3.5" />
+              Round Socket Cap
+            </button>
+
+            <button
+              onClick={handleTrimHingeExcess}
+              className="px-2.5 py-1 rounded-md bg-[#24211a] hover:bg-[#332f24] text-[#ffd166] border border-[#ffd166]/30 flex items-center gap-1.5 font-medium transition-colors"
+              title="Trim jagged pixels outside rotation socket radius"
+            >
+              <Maximize2 className="size-3.5" />
+              Trim Hinge Excess
+            </button>
+
+            <button
+              onClick={handleSmoothContour}
+              className="px-2.5 py-1 rounded-md bg-[#1c1c1c] hover:bg-[#282828] text-[#e0e0e0] border border-[#383838] flex items-center gap-1.5 font-medium transition-colors"
+              title="Eliminate 1px jagged spurs along cut boundaries"
+            >
+              Smooth Contour
+            </button>
+          </div>
+        </div>
+
+        {/* Main Canvas Viewport Area */}
+        <div
+          ref={containerRef}
+          onWheel={handleWheel}
+          className="flex-1 min-h-0 bg-[#080808] overflow-auto flex items-center justify-center p-8 relative"
+        >
           {isLoading ? (
             <div className="flex flex-col items-center gap-3 text-muted">
               <div className="size-8 border-2 border-[#63f6ff] border-t-transparent rounded-full animate-spin" />
-              <span className="text-xs">Loading figure part...</span>
+              <span className="text-xs">Loading figure part and rotation hinges...</span>
             </div>
           ) : (
-            <div className="relative border border-[#333] rounded-lg overflow-hidden shadow-2xl bg-[#141414]">
+            <div
+              className="relative shadow-2xl rounded border border-[#2b2b2b] bg-[#141414] overflow-hidden"
+              style={{
+                width: `${displayWidth}px`,
+                height: `${displayHeight}px`,
+                minWidth: `${displayWidth}px`,
+                minHeight: `${displayHeight}px`,
+              }}
+            >
+              {/* Pixel Mask Canvas (renders image & cut texture) */}
               <canvas
                 ref={canvasRef}
                 style={{
                   width: `${displayWidth}px`,
                   height: `${displayHeight}px`,
-                  cursor: "crosshair",
                   imageRendering: "pixelated",
+                  display: "block",
+                  position: "absolute",
+                  left: 0,
+                  top: 0,
+                }}
+              />
+
+              {/* Crisp 1px Screen Overlay Canvas (crosshairs, circles, snap highlights) */}
+              <canvas
+                ref={overlayCanvasRef}
+                style={{
+                  width: `${displayWidth}px`,
+                  height: `${displayHeight}px`,
+                  display: "block",
+                  position: "absolute",
+                  left: 0,
+                  top: 0,
+                  cursor: "crosshair",
+                  pointerEvents: "auto",
+                  touchAction: "none",
                 }}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
@@ -551,17 +1037,23 @@ export function BrushEditor() {
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3.5 border-t border-[#222] flex flex-wrap items-center justify-between gap-3 bg-[#111]">
-          <div className="flex items-center gap-2 text-xs text-[#a3a3a3]">
-            <Sparkles className="size-3.5 text-[#63f6ff]" />
-            <span>
-              <strong className="text-white font-medium">Brush (cyan)</strong>{" "}
-              restores silhouette •{" "}
-              <strong className="text-[#ff5f9e] font-medium">
-                Eraser (pink)
-              </strong>{" "}
-              cuts away
+        <div className="px-5 py-3 border-t border-[#222] flex flex-wrap items-center justify-between gap-3 bg-[#111] shrink-0">
+          <div className="flex items-center gap-3 text-xs text-[#a3a3a3]">
+            <span className="flex items-center gap-1.5">
+              <span className="size-2 rounded-full bg-[#63f6ff]" />
+              <strong>Primary Hinge:</strong> {attachment.localPivotX},{attachment.localPivotY} (R:{attachment.thickness}px)
             </span>
+            {crosshairPoints.length >= 2 && (
+              <span className="flex items-center gap-1.5">
+                <span className="size-2 rounded-full bg-[#ffd166]" />
+                <strong>Distal Hinge:</strong> {Math.round(crosshairPoints[1].x)},{Math.round(crosshairPoints[1].y)}
+              </span>
+            )}
+            {snapStatus?.snapped && (
+              <span className="px-2 py-0.5 rounded bg-[#ffe600]/15 text-[#ffe600] border border-[#ffe600]/30 font-mono text-[11px] animate-pulse">
+                SNAPPED TO {snapStatus.type?.toUpperCase()}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2.5 ml-auto">
