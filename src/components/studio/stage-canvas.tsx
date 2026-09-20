@@ -80,6 +80,7 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
   const dragRef = useRef<
     | { type: "move"; jointId: string }
     | { type: "resize"; jointId: string; centerX: number; centerY: number }
+    | { type: "radialOffset"; jointId: string; pointIndex: number; centerX: number; centerY: number }
     | null
   >(null);
   const [canvasCursor, setCanvasCursor] = useState<string>("default");
@@ -194,6 +195,7 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
                   false,
                   activeResizeId === joint.id,
                   joint.label,
+                  joint,
                 );
               }
               ctx.restore();
@@ -303,6 +305,37 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
             placeNextPin(p.x, p.y);
             return;
           }
+
+          // 1. Check if we hit any of the 8 radial handles of the selected joint first
+          if (selectedId) {
+            const sel = joints.find((j) => j.id === selectedId);
+            if (sel) {
+              const offsets = sel.radialOffsets || [1, 1, 1, 1, 1, 1, 1, 1];
+              const fit = fitRef.current;
+              const s = fit.s || 1;
+              const t = Math.max(8, sel.thickness);
+              for (let i = 0; i < 8; i++) {
+                const angle = (i * Math.PI) / 4;
+                const r = t * 1.5 * (offsets[i] ?? 1.0);
+                const hx = sel.x + r * Math.cos(angle);
+                const hy = sel.y + r * Math.sin(angle);
+                const d = Math.hypot(hx - p.x, hy - p.y);
+                if (d <= 12 / s) {
+                  dragRef.current = {
+                    type: "radialOffset",
+                    jointId: sel.id,
+                    pointIndex: i,
+                    centerX: sel.x,
+                    centerY: sel.y,
+                  };
+                  setActiveResizeId(null);
+                  return;
+                }
+              }
+            }
+          }
+
+          // 2. Otherwise fall back to standard joint move/resize
           const hit = hitJoint(p.x, p.y);
           if (hit) {
             setSelected(hit.joint.id);
@@ -337,16 +370,57 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
               const d = Math.hypot(p.x - dragRef.current.centerX, p.y - dragRef.current.centerY);
               const newThickness = Math.max(6, Math.min(180, Math.round(d)));
               updateJoint(dragRef.current.jointId, { thickness: newThickness });
+            } else if (dragRef.current.type === "radialOffset") {
+              const jointId = dragRef.current.jointId;
+              const idx = dragRef.current.pointIndex;
+              const joint = joints.find((j) => j.id === jointId);
+              if (joint) {
+                const angle = (idx * Math.PI) / 4;
+                const dx = p.x - joint.x;
+                const dy = p.y - joint.y;
+                const projD = dx * Math.cos(angle) + dy * Math.sin(angle);
+                const baseR = Math.max(8, joint.thickness) * 1.5;
+                const mult = Math.max(0.15, Math.min(3.5, projD / baseR));
+                const currentOffsets = joint.radialOffsets ? [...joint.radialOffsets] : [1, 1, 1, 1, 1, 1, 1, 1];
+                currentOffsets[idx] = Number(mult.toFixed(3));
+                updateJoint(jointId, { radialOffsets: currentOffsets });
+              }
             }
             return;
           }
 
           if (mode === "bones" && pinMode !== "pin") {
-            const hit = hitJoint(p.x, p.y);
-            if (hit) {
-              setCanvasCursor(hit.type === "resize" ? "ew-resize" : "move");
+            let hoverRadial = false;
+            if (selectedId) {
+              const sel = joints.find((j) => j.id === selectedId);
+              if (sel) {
+                const offsets = sel.radialOffsets || [1, 1, 1, 1, 1, 1, 1, 1];
+                const fit = fitRef.current;
+                const s = fit.s || 1;
+                const t = Math.max(8, sel.thickness);
+                for (let i = 0; i < 8; i++) {
+                  const angle = (i * Math.PI) / 4;
+                  const r = t * 1.5 * (offsets[i] ?? 1.0);
+                  const hx = sel.x + r * Math.cos(angle);
+                  const hy = sel.y + r * Math.sin(angle);
+                  const d = Math.hypot(hx - p.x, hy - p.y);
+                  if (d <= 12 / s) {
+                    hoverRadial = true;
+                    break;
+                  }
+                }
+              }
+            }
+
+            if (hoverRadial) {
+              setCanvasCursor("pointer");
             } else {
-              setCanvasCursor("default");
+              const hit = hitJoint(p.x, p.y);
+              if (hit) {
+                setCanvasCursor(hit.type === "resize" ? "ew-resize" : "move");
+              } else {
+                setCanvasCursor("default");
+              }
             }
           } else {
             setCanvasCursor(pinMode === "pin" ? "crosshair" : "default");
@@ -370,6 +444,7 @@ function drawRotationCrosshair(
   isPin: boolean,
   isResizing: boolean = false,
   label?: string,
+  joint?: Joint,
 ) {
   const t = Math.max(8, thickness);
   const r1 = Math.round(t * 0.5);
@@ -380,10 +455,38 @@ function drawRotationCrosshair(
   ctx.save();
   ctx.lineWidth = 1;
 
-  // 1. Concentric circles with 1px crisp strokes
-  // Outer circle (overlap margin): 1.5x thickness
+  // 1. Concentric shapes with 1px crisp strokes
+  // Outer circle (overlap margin): 1.5x thickness (rendered curved if 8 points exist)
   ctx.beginPath();
-  ctx.arc(x, y, r3, 0, Math.PI * 2);
+  if (joint && joint.radialOffsets && joint.radialOffsets.length === 8) {
+    const points: { x: number; y: number }[] = [];
+    for (let i = 0; i < 8; i++) {
+      const angle = (i * Math.PI) / 4;
+      const r = t * 1.5 * (joint.radialOffsets[i] ?? 1.0);
+      points.push({
+        x: x + r * Math.cos(angle),
+        y: y + r * Math.sin(angle),
+      });
+    }
+    const lastPt = points[7];
+    const firstPt = points[0];
+    ctx.moveTo((lastPt.x + firstPt.x) / 2, (lastPt.y + firstPt.y) / 2);
+    for (let i = 0; i < 8; i++) {
+      const p = points[i];
+      const next = points[(i + 1) % 8];
+      ctx.quadraticCurveTo(p.x, p.y, (p.x + next.x) / 2, (p.y + next.y) / 2);
+    }
+    ctx.closePath();
+  } else {
+    ctx.arc(x, y, r3, 0, Math.PI * 2);
+  }
+  
+  // Fill on point adjust: translucent neon fill inside curved region
+  ctx.fillStyle = isSelected
+    ? "rgba(99, 246, 255, 0.08)"
+    : "rgba(241, 236, 228, 0.03)";
+  ctx.fill();
+
   ctx.strokeStyle = isSelected
     ? "rgba(99, 246, 255, 0.45)"
     : "rgba(241, 236, 228, 0.2)";
@@ -455,7 +558,36 @@ function drawRotationCrosshair(
     }
   }
 
-  // 5. Dynamic label with live radius
+  // 5. Draw 8 customizable points along the outer curve for selection
+  if (isSelected && joint) {
+    const offsets = joint.radialOffsets || [1, 1, 1, 1, 1, 1, 1, 1];
+    for (let i = 0; i < 8; i++) {
+      const angle = (i * Math.PI) / 4;
+      const r = t * 1.5 * (offsets[i] ?? 1.0);
+      const hx = x + r * Math.cos(angle);
+      const hy = y + r * Math.sin(angle);
+
+      // Radial guideline dashed line
+      ctx.beginPath();
+      ctx.moveTo(x + r1 * Math.cos(angle), y + r1 * Math.sin(angle));
+      ctx.lineTo(hx, hy);
+      ctx.strokeStyle = "rgba(99, 246, 255, 0.35)";
+      ctx.setLineDash([2, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Control Handle circle
+      ctx.beginPath();
+      ctx.arc(hx, hy, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = "#ff5f9e"; // Vivid hot pink handle
+      ctx.fill();
+      ctx.strokeStyle = "#000000";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+  }
+
+  // 6. Dynamic label with live radius
   if (label && (isSelected || isPin || isResizing)) {
     ctx.font = "600 12px Outfit, sans-serif";
     ctx.fillStyle = isResizing ? "#ffc53d" : isSelected ? "#63f6ff" : "#f1ece4";
@@ -494,6 +626,7 @@ function drawBones(
       pin,
       isResizing,
       joint.label,
+      joint,
     );
   }
 }

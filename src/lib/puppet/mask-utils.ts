@@ -13,6 +13,7 @@ export type CrosshairPoint = {
   radii: number[];
   label?: string;
   isParent?: boolean;
+  joint?: any;
 };
 
 export type SnapResult = {
@@ -222,8 +223,8 @@ export function cleanDanglingPixels(
   let removedPixels = 0;
   for (const comp of components) {
     if (comp === mainComponent) continue;
-    // Any disconnected island smaller than threshold or significantly smaller than main component is cleared
-    if (comp.size < minSizeThreshold || comp.size < mainComponent.size * 0.12) {
+    // Only prune tiny floating dust specks (< 12px) that are not part of any garment or extremity
+    if (comp.size < Math.min(12, minSizeThreshold)) {
       for (const idx of comp.pixels) {
         result[idx] = 0;
         removedPixels++;

@@ -12,6 +12,7 @@ import {
   SnapResult,
 } from "@/lib/puppet/mask-utils";
 import { loadHtmlImage } from "@/lib/puppet/image";
+import { getCurvedRadiusAtAngle } from "@/lib/puppet/cut-parts";
 import { clearImageCache } from "@/components/studio/stage-canvas";
 import { toast } from "sonner";
 import {
@@ -69,6 +70,7 @@ export function BrushEditor() {
 
     // 1. Primary rotation point (parent pivot hinge)
     const p1Thickness = Math.max(8, attachment.thickness || 20);
+    const parentJoint = joints.find((j) => j.id === attachment.boneId);
     points.push({
       x: attachment.localPivotX,
       y: attachment.localPivotY,
@@ -79,6 +81,7 @@ export function BrushEditor() {
       ],
       label: "Hinge Pivot",
       isParent: true,
+      joint: parentJoint,
     });
 
     // 2. Child rotation points (distal hinges, e.g. elbow, knee, wrist)
@@ -97,6 +100,7 @@ export function BrushEditor() {
         ],
         label: cj.label || "Distal Hinge",
         isParent: false,
+        joint: cj,
       });
     }
 
@@ -226,9 +230,35 @@ export function BrushEditor() {
         ctx.save();
         ctx.lineWidth = 1;
 
-        // Outer concentric circle (overlap zone: 1.5x)
+        // Outer concentric circle (overlap zone: 1.5x) - curved if radialOffsets are defined
         ctx.beginPath();
-        ctx.arc(sx, sy, r3, 0, Math.PI * 2);
+        if (pt.joint && pt.joint.radialOffsets && pt.joint.radialOffsets.length === 8) {
+          const points: { x: number; y: number }[] = [];
+          for (let i = 0; i < 8; i++) {
+            const angle = (i * Math.PI) / 4;
+            const r = pt.radii[1] * 1.5 * zoom * (pt.joint.radialOffsets[i] ?? 1.0);
+            points.push({
+              x: sx + r * Math.cos(angle),
+              y: sy + r * Math.sin(angle),
+            });
+          }
+          const lastPt = points[7];
+          const firstPt = points[0];
+          ctx.moveTo((lastPt.x + firstPt.x) / 2, (lastPt.y + firstPt.y) / 2);
+          for (let i = 0; i < 8; i++) {
+            const p = points[i];
+            const next = points[(i + 1) % 8];
+            ctx.quadraticCurveTo(p.x, p.y, (p.x + next.x) / 2, (p.y + next.y) / 2);
+          }
+          ctx.closePath();
+        } else {
+          ctx.arc(sx, sy, r3, 0, Math.PI * 2);
+        }
+
+        // Translucent background fill
+        ctx.fillStyle = pt.isParent ? "rgba(99, 246, 255, 0.05)" : "rgba(255, 209, 102, 0.03)";
+        ctx.fill();
+
         ctx.strokeStyle = "rgba(99, 246, 255, 0.35)";
         ctx.setLineDash([3, 3]);
         ctx.stroke();
@@ -245,6 +275,35 @@ export function BrushEditor() {
         ctx.arc(sx, sy, r1, 0, Math.PI * 2);
         ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
         ctx.stroke();
+
+        // 8 points and guide lines
+        if (pt.joint) {
+          const offsets = pt.joint.radialOffsets || [1, 1, 1, 1, 1, 1, 1, 1];
+          for (let i = 0; i < 8; i++) {
+            const angle = (i * Math.PI) / 4;
+            const r = pt.radii[1] * 1.5 * zoom * (offsets[i] ?? 1.0);
+            const hx = sx + r * Math.cos(angle);
+            const hy = sy + r * Math.sin(angle);
+
+            // Radial guide line
+            ctx.beginPath();
+            ctx.moveTo(sx + r1 * Math.cos(angle), sy + r1 * Math.sin(angle));
+            ctx.lineTo(hx, hy);
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
+            ctx.setLineDash([2, 2]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Dot handle
+            ctx.beginPath();
+            ctx.arc(hx, hy, 3.0, 0, Math.PI * 2);
+            ctx.fillStyle = "#ff5f9e";
+            ctx.fill();
+            ctx.strokeStyle = "#000000";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          }
+        }
 
         // Crisp 1px horizontal and vertical crosshairs
         ctx.beginPath();
@@ -482,6 +541,124 @@ export function BrushEditor() {
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const coords = getCanvasCoords(e);
     if (!coords || !attachment || !activeMaskRef.current) return;
+
+    // Toggle Brush Mode on Click: if snapped to a joint circle, toggle between fill and remove
+    if (snapEnabled && coords.snap && coords.snap.snapped && coords.snap.type === "circle" && coords.snap.targetRadius) {
+      const targetPoint = coords.snap.targetPoint;
+      const r = coords.snap.targetRadius;
+      const cx = targetPoint.x;
+      const cy = targetPoint.y;
+      
+      if (targetPoint) {
+        const joint = targetPoint.joint;
+        const isOuterCircle = targetPoint.radii[2] === r;
+        const hasOffsets = isOuterCircle && joint && joint.radialOffsets && joint.radialOffsets.length === 8;
+        
+        const mask = activeMaskRef.current;
+        const w = attachment.width;
+        const h = attachment.height;
+        
+        let filledCount = 0;
+        let totalCount = 0;
+        
+        // Bounding box for calculation
+        let maxR = r;
+        if (hasOffsets && joint && joint.radialOffsets) {
+          for (let i = 0; i < 8; i++) {
+            const offR = Math.max(8, joint.thickness) * 1.5 * (joint.radialOffsets[i] ?? 1.0);
+            if (offR > maxR) maxR = offR;
+          }
+        }
+        
+        const minX = Math.max(0, Math.floor(cx - maxR));
+        const maxX = Math.min(w - 1, Math.ceil(cx + maxR));
+        const minY = Math.max(0, Math.floor(cy - maxR));
+        const maxY = Math.min(h - 1, Math.ceil(cy + maxR));
+        
+        const isInside = (px: number, py: number) => {
+          const dx = px - cx;
+          const dy = py - cy;
+          const dist = Math.hypot(dx, dy);
+          if (hasOffsets && joint) {
+            const angle = Math.atan2(dy, dx);
+            const allowedRadius = getCurvedRadiusAtAngle(joint, angle);
+            return dist <= allowedRadius;
+          } else {
+            return dist <= r;
+          }
+        };
+        
+        for (let y = minY; y <= maxY; y++) {
+          for (let x = minX; x <= maxX; x++) {
+            if (isInside(x, y)) {
+              totalCount++;
+              if (mask[y * w + x] > 128) {
+                filledCount++;
+              }
+            }
+          }
+        }
+        
+        // Count filled pixels outside the circle to support a 3-click cycle
+        let outsideFilled = 0;
+        for (let y = 0; y < h; y++) {
+          const rowOffset = y * w;
+          for (let x = 0; x < w; x++) {
+            if (mask[rowOffset + x] > 128 && !isInside(x, y)) {
+              outsideFilled++;
+            }
+          }
+        }
+
+        const insideRatio = filledCount / Math.max(1, totalCount);
+        const nextMask = new Uint8Array(mask);
+
+        if (insideRatio < 0.45) {
+          // Click 1: Fill inside the circle
+          for (let y = minY; y <= maxY; y++) {
+            const rowOffset = y * w;
+            for (let x = minX; x <= maxX; x++) {
+              if (isInside(x, y)) {
+                nextMask[rowOffset + x] = 255;
+              }
+            }
+          }
+        } else if (outsideFilled > 15) {
+          // Click 2 (or 3rd state if clicked when filled): Remove outside of circles
+          for (let y = 0; y < h; y++) {
+            const rowOffset = y * w;
+            for (let x = 0; x < w; x++) {
+              if (!isInside(x, y)) {
+                nextMask[rowOffset + x] = 0;
+              }
+            }
+          }
+        } else {
+          // Click 3: Remove inside the circle
+          for (let y = minY; y <= maxY; y++) {
+            const rowOffset = y * w;
+            for (let x = minX; x <= maxX; x++) {
+              if (isInside(x, y)) {
+                nextMask[rowOffset + x] = 0;
+              }
+            }
+          }
+        }
+        
+        activeMaskRef.current = nextMask;
+        renderMaskCanvas();
+        renderOverlayCanvas();
+        
+        // Push to history
+        const newHistory = history.slice(0, historyIndex + 1);
+        newHistory.push(new Uint8Array(nextMask));
+        setHistory(newHistory);
+        setHistoryIndex(newHistory.length - 1);
+        
+        setIsDrawing(false);
+        return;
+      }
+    }
 
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     setIsDrawing(true);
@@ -772,69 +949,67 @@ export function BrushEditor() {
   const displayHeight = Math.round(attachment.height * zoom);
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-200 select-none">
-      <div className="bg-[#0c0c0c] border border-[#262626] rounded-2xl shadow-2xl w-full max-w-5xl flex flex-col h-[94vh] overflow-hidden text-[#f5f5f5]">
+    <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex items-center justify-center p-0 sm:p-2 animate-in fade-in duration-200 select-none">
+      <div className="bg-[#0a0a0a] border border-[#222] rounded-none sm:rounded-xl shadow-2xl w-full max-w-6xl flex flex-col h-full sm:h-[97vh] overflow-hidden text-[#f5f5f5]">
         {/* Header */}
-        <div className="px-5 py-3 border-b border-[#222] flex items-center justify-between bg-[#111] shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="p-1.5 rounded-lg bg-[#63f6ff]/10 text-[#63f6ff]">
-              <Crosshair className="size-4" />
+        <div className="px-4 py-1.5 border-b border-[#222] flex items-center justify-between bg-[#111] shrink-0">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1 rounded-md bg-[#63f6ff]/10 text-[#63f6ff]">
+              <Crosshair className="size-3.5" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-display text-base font-semibold tracking-tight text-white">
-                  Precision Brush &amp; Rigging: {attachment.label}
-                </span>
-                <span className="text-[11px] font-mono text-[#a3a3a3] bg-[#1a1a1a] px-2 py-0.5 rounded border border-[#333]">
-                  {attachment.width}×{attachment.height}px
-                </span>
-              </div>
-              <p className="text-[11px] text-[#888]">
-                1px crosshairs &amp; concentric circles at rotation points • Snap enabled
-              </p>
+            <div className="flex items-center gap-2">
+              <span className="font-display text-sm font-semibold tracking-tight text-white">
+                Precision Brush: {attachment.label}
+              </span>
+              <span className="text-[10px] font-mono text-[#a3a3a3] bg-[#1a1a1a] px-1.5 py-0.2 rounded border border-[#2b2b2b]">
+                {attachment.width}×{attachment.height}px
+              </span>
+              <span className="text-[10px] text-[#777] hidden md:inline">
+                • Click joint circles to Fill/Remove/Trim
+              </span>
             </div>
           </div>
           <button
             onClick={handleClose}
-            className="text-[#a3a3a3] hover:text-white p-1.5 rounded-md hover:bg-[#222] transition-colors"
+            className="text-[#a3a3a3] hover:text-white p-1 rounded-md hover:bg-[#222] transition-colors"
             title="Close"
           >
-            <X className="size-5" />
+            <X className="size-4" />
           </button>
         </div>
 
         {/* Primary Controls Toolbar */}
-        <div className="px-5 py-2.5 border-b border-[#222] flex flex-wrap items-center justify-between gap-2.5 bg-[#141414] shrink-0">
+        <div className="px-4 py-1.5 border-b border-[#222] flex flex-wrap items-center justify-between gap-1.5 bg-[#141414] shrink-0">
           {/* Brush / Eraser */}
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1">
             <button
               onClick={() => setMode("add")}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all border ${
+              className={`px-2.5 py-1 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all border ${
                 mode === "add"
                   ? "bg-[#63f6ff] border-[#63f6ff] text-[#031012] shadow-md shadow-[#63f6ff]/20"
                   : "bg-[#1f1f1f] border-[#333] text-[#a3a3a3] hover:text-white"
               }`}
               title="Paint to add pixels back"
             >
-              <Paintbrush className="size-3.5" />
+              <Paintbrush className="size-3" />
               Brush (Add)
             </button>
             <button
               onClick={() => setMode("erase")}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all border ${
+              className={`px-2.5 py-1 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all border ${
                 mode === "erase"
                   ? "bg-[#ff5f9e] border-[#ff5f9e] text-white shadow-md shadow-[#ff5f9e]/20"
                   : "bg-[#1f1f1f] border-[#333] text-[#a3a3a3] hover:text-white"
               }`}
               title="Erase to cut out dangling debris"
             >
-              <Eraser className="size-3.5" />
+              <Eraser className="size-3" />
               Eraser (Cut)
             </button>
           </div>
 
           {/* Brush Size */}
-          <div className="flex items-center gap-2 px-2.5 py-1 bg-[#1a1a1a] rounded-lg border border-[#2b2b2b]">
+          <div className="flex items-center gap-1.5 px-2 py-0.5 bg-[#1a1a1a] rounded-md border border-[#2b2b2b]">
             <span className="text-xs text-[#a3a3a3] font-medium whitespace-nowrap">
               Radius: {radius}px
             </span>
@@ -844,64 +1019,64 @@ export function BrushEditor() {
               max={56}
               value={radius}
               onChange={(e) => setRadius(Number(e.target.value))}
-              className="w-20 sm:w-28 accent-[#63f6ff] cursor-pointer"
+              className="w-16 sm:w-24 h-1 accent-[#63f6ff] cursor-pointer"
             />
           </div>
 
           {/* Snapping & Crosshairs Toggles */}
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1">
             <button
               onClick={() => setSnapEnabled(!snapEnabled)}
-              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all border ${
+              className={`px-2 py-1 rounded-md text-xs font-medium flex items-center gap-1 transition-all border ${
                 snapEnabled
                   ? "bg-[#ffe600]/15 border-[#ffe600]/50 text-[#ffe600]"
                   : "bg-[#1a1a1a] border-[#333] text-[#888] hover:text-white"
               }`}
               title="Snap brush and cut strokes to rotation point circles and axes"
             >
-              <Magnet className="size-3.5" />
+              <Magnet className="size-3" />
               Snap {snapEnabled ? "ON" : "OFF"}
             </button>
 
             <button
               onClick={() => setShowCrosshairs(!showCrosshairs)}
-              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all border ${
+              className={`px-2 py-1 rounded-md text-xs font-medium flex items-center gap-1 transition-all border ${
                 showCrosshairs
                   ? "bg-[#63f6ff]/15 border-[#63f6ff]/40 text-[#63f6ff]"
                   : "bg-[#1a1a1a] border-[#333] text-[#888] hover:text-white"
               }`}
               title="Toggle 1px rotation point crosshairs and concentric circles"
             >
-              <Crosshair className="size-3.5" />
+              <Crosshair className="size-3" />
               Crosshairs
             </button>
           </div>
 
           {/* Scale & Zoom Controls */}
-          <div className="flex items-center gap-1 bg-[#1a1a1a] px-2 py-1 rounded-lg border border-[#2b2b2b]">
+          <div className="flex items-center gap-1 bg-[#1a1a1a] px-1.5 py-0.5 rounded-md border border-[#2b2b2b]">
             <button
               onClick={() => setZoom(Math.max(0.75, Number((zoom - 0.5).toFixed(1))))}
-              className="p-1 rounded text-[#a3a3a3] hover:text-white hover:bg-[#282828]"
+              className="p-0.5 rounded text-[#a3a3a3] hover:text-white hover:bg-[#282828]"
               title="Zoom Out"
             >
-              <ZoomOut className="size-3.5" />
+              <ZoomOut className="size-3" />
             </button>
-            <span className="text-xs font-mono font-medium text-white px-1">
+            <span className="text-[11px] font-mono font-medium text-white px-0.5">
               {Math.round(zoom * 100)}%
             </span>
             <button
               onClick={() => setZoom(Math.min(8.0, Number((zoom + 0.5).toFixed(1))))}
-              className="p-1 rounded text-[#a3a3a3] hover:text-white hover:bg-[#282828]"
+              className="p-0.5 rounded text-[#a3a3a3] hover:text-white hover:bg-[#282828]"
               title="Zoom In"
             >
-              <ZoomIn className="size-3.5" />
+              <ZoomIn className="size-3" />
             </button>
             <button
               onClick={() => setZoom(computeCrosshairFitScale())}
-              className="px-2 py-0.5 text-[11px] rounded bg-[#282828] text-[#a3a3a3] hover:text-white ml-1 font-medium"
+              className="px-1.5 py-0.2 text-[10px] rounded bg-[#282828] text-[#a3a3a3] hover:text-white ml-0.5 font-medium"
               title="Scale between both rotation crosshairs"
             >
-              Fit Crosshairs
+              Fit
             </button>
           </div>
 
@@ -910,70 +1085,70 @@ export function BrushEditor() {
             <button
               onClick={handleUndo}
               disabled={historyIndex <= 0}
-              className="p-1.5 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] disabled:opacity-30 disabled:pointer-events-none transition-colors"
+              className="p-1 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] disabled:opacity-30 disabled:pointer-events-none transition-colors"
               title="Undo (Ctrl+Z)"
             >
-              <Undo2 className="size-4" />
+              <Undo2 className="size-3.5" />
             </button>
             <button
               onClick={handleRedo}
               disabled={historyIndex >= history.length - 1}
-              className="p-1.5 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] disabled:opacity-30 disabled:pointer-events-none transition-colors"
+              className="p-1 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] disabled:opacity-30 disabled:pointer-events-none transition-colors"
               title="Redo (Ctrl+Y)"
             >
-              <Redo2 className="size-4" />
+              <Redo2 className="size-3.5" />
             </button>
             <button
               onClick={handleReset}
-              className="p-1.5 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] transition-colors"
+              className="p-1 rounded-md border border-[#333] bg-[#1a1a1a] text-[#f5f5f5] hover:bg-[#282828] transition-colors"
               title="Reset to Original Cut"
             >
-              <RotateCcw className="size-4" />
+              <RotateCcw className="size-3.5" />
             </button>
           </div>
         </div>
 
         {/* Smart Shaping & Debris Bar */}
-        <div className="px-5 py-2 border-b border-[#222] flex flex-wrap items-center justify-between gap-2 bg-[#0e0e0e] shrink-0 text-xs">
-          <div className="flex items-center gap-1.5 text-[#a3a3a3]">
-            <Sparkles className="size-3.5 text-[#63f6ff]" />
+        <div className="px-4 py-1 border-b border-[#222] flex flex-wrap items-center justify-between gap-1.5 bg-[#0e0e0e] shrink-0 text-[11px]">
+          <div className="flex items-center gap-1 text-[#a3a3a3]">
+            <Sparkles className="size-3 text-[#63f6ff]" />
             <span className="font-medium text-white">Smart Shaping:</span>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <button
               onClick={handleCleanDanglingPixels}
-              className="px-2.5 py-1 rounded-md bg-[#231a28] hover:bg-[#34243d] text-[#ff80bf] border border-[#ff80bf]/30 flex items-center gap-1.5 font-medium transition-colors"
+              className="px-2 py-0.5 rounded bg-[#231a28] hover:bg-[#34243d] text-[#ff80bf] border border-[#ff80bf]/30 flex items-center gap-1 font-medium transition-colors cursor-pointer"
               title="Purge isolated dangling debris and disconnected scraps"
             >
-              <Wand2 className="size-3.5" />
-              Clean Dangling Debris
+              <Wand2 className="size-3" />
+              Clean Debris
             </button>
 
             <button
               onClick={handleAddSocketCap}
-              className="px-2.5 py-1 rounded-md bg-[#16272b] hover:bg-[#203a40] text-[#63f6ff] border border-[#63f6ff]/30 flex items-center gap-1.5 font-medium transition-colors"
+              className="px-2 py-0.5 rounded bg-[#16272b] hover:bg-[#203a40] text-[#63f6ff] border border-[#63f6ff]/30 flex items-center gap-1 font-medium transition-colors cursor-pointer"
               title="Generate a clean circular hinge socket cap at rotation point"
             >
-              <ShieldAlert className="size-3.5" />
-              Round Socket Cap
+              <ShieldAlert className="size-3" />
+              Round Cap
             </button>
 
             <button
               onClick={handleTrimHingeExcess}
-              className="px-2.5 py-1 rounded-md bg-[#24211a] hover:bg-[#332f24] text-[#ffd166] border border-[#ffd166]/30 flex items-center gap-1.5 font-medium transition-colors"
+              className="px-2 py-0.5 rounded bg-[#24211a] hover:bg-[#332f24] text-[#ffd166] border border-[#ffd166]/30 flex items-center gap-1 font-medium transition-colors cursor-pointer"
               title="Trim jagged pixels outside rotation socket radius"
             >
-              <Maximize2 className="size-3.5" />
-              Trim Hinge Excess
+              <Maximize2 className="size-3" />
+              Trim Excess
             </button>
 
             <button
               onClick={handleSmoothContour}
-              className="px-2.5 py-1 rounded-md bg-[#1c1c1c] hover:bg-[#282828] text-[#e0e0e0] border border-[#383838] flex items-center gap-1.5 font-medium transition-colors"
+              className="px-2 py-0.5 rounded bg-[#1c1c1c] hover:bg-[#282828] text-[#e0e0e0] border border-[#383838] flex items-center gap-1 font-medium transition-colors cursor-pointer"
               title="Eliminate 1px jagged spurs along cut boundaries"
             >
-              Smooth Contour
+              Smooth
             </button>
           </div>
         </div>
@@ -982,7 +1157,7 @@ export function BrushEditor() {
         <div
           ref={containerRef}
           onWheel={handleWheel}
-          className="flex-1 min-h-0 bg-[#080808] overflow-auto flex items-center justify-center p-8 relative"
+          className="flex-1 min-h-0 bg-[#080808] overflow-auto flex items-center justify-center p-3 relative"
         >
           {isLoading ? (
             <div className="flex flex-col items-center gap-3 text-muted">
@@ -1037,40 +1212,40 @@ export function BrushEditor() {
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-[#222] flex flex-wrap items-center justify-between gap-3 bg-[#111] shrink-0">
-          <div className="flex items-center gap-3 text-xs text-[#a3a3a3]">
-            <span className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full bg-[#63f6ff]" />
-              <strong>Primary Hinge:</strong> {attachment.localPivotX},{attachment.localPivotY} (R:{attachment.thickness}px)
+        <div className="px-4 py-1.5 border-t border-[#222] flex flex-wrap items-center justify-between gap-2 bg-[#111] shrink-0 text-[11px]">
+          <div className="flex items-center gap-2.5 text-xs text-[#a3a3a3]">
+            <span className="flex items-center gap-1">
+              <span className="size-1.5 rounded-full bg-[#63f6ff]" />
+              <strong>Hinge:</strong> {attachment.localPivotX},{attachment.localPivotY} ({attachment.thickness}px)
             </span>
             {crosshairPoints.length >= 2 && (
-              <span className="flex items-center gap-1.5">
-                <span className="size-2 rounded-full bg-[#ffd166]" />
-                <strong>Distal Hinge:</strong> {Math.round(crosshairPoints[1].x)},{Math.round(crosshairPoints[1].y)}
+              <span className="flex items-center gap-1">
+                <span className="size-1.5 rounded-full bg-[#ffd166]" />
+                <strong>Distal:</strong> {Math.round(crosshairPoints[1].x)},{Math.round(crosshairPoints[1].y)}
               </span>
             )}
             {snapStatus?.snapped && (
-              <span className="px-2 py-0.5 rounded bg-[#ffe600]/15 text-[#ffe600] border border-[#ffe600]/30 font-mono text-[11px] animate-pulse">
-                SNAPPED TO {snapStatus.type?.toUpperCase()}
+              <span className="px-1.5 py-0.2 rounded bg-[#ffe600]/15 text-[#ffe600] border border-[#ffe600]/30 font-mono text-[10px] animate-pulse">
+                SNAPPED
               </span>
             )}
           </div>
 
-          <div className="flex items-center gap-2.5 ml-auto">
+          <div className="flex items-center gap-2 ml-auto">
             <button
               type="button"
               onClick={handleClose}
-              className="px-4 py-2 rounded-lg text-sm font-medium border border-[#333] bg-[#181818] text-[#a3a3a3] hover:text-white hover:bg-[#222] transition-colors"
+              className="px-3 py-1 rounded-md text-xs font-medium border border-[#333] bg-[#181818] text-[#a3a3a3] hover:text-white hover:bg-[#222] transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="button"
               onClick={handleSave}
-              className="px-5 py-2 rounded-lg text-sm font-bold bg-[#63f6ff] hover:bg-[#51e7ef] text-[#031012] shadow-lg shadow-[#63f6ff]/25 hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center gap-2 cursor-pointer"
+              className="px-3.5 py-1 rounded-md text-xs font-bold bg-[#63f6ff] hover:bg-[#51e7ef] text-[#031012] shadow-md shadow-[#63f6ff]/20 hover:scale-[1.01] active:scale-[0.99] transition-all flex items-center gap-1.5 cursor-pointer"
             >
-              <Check className="size-4 stroke-[2.5]" />
-              Apply &amp; Save Cut
+              <Check className="size-3.5 stroke-[2.5]" />
+              Save Cut
             </button>
           </div>
         </div>

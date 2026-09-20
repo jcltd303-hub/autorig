@@ -16,6 +16,7 @@ export type Joint = {
   minAngle: number;
   maxAngle: number;
   zIndex: number;
+  radialOffsets?: number[];
 };
 
 export type PartMaskSource = "auto" | "edited" | "ai";

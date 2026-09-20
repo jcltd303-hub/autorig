@@ -148,12 +148,14 @@ export function buildCutSegments(joints: Joint[]): Segment[] {
       return { joint, ax: joint.x, ay: joint.y, bx, by, radius: Math.max(8, joint.thickness * 1.15), leaf: false };
     }
 
+    // Terminal / leaf joint (hands, feet, head top, tail tip, etc.)
     const parent = joint.parentId ? joints.find((j) => j.id === joint.parentId) : null;
     if (parent) {
       const dx = joint.x - parent.x;
       const dy = joint.y - parent.y;
       const len = Math.hypot(dx, dy) || 1;
-      const extension = Math.max(8, Math.min(28, len * 0.32));
+      // Project the limb forward in the direction of the extremity
+      const extension = Math.max(20, Math.min(80, len * 0.8));
       return {
         joint,
         ax: joint.x,
@@ -236,14 +238,14 @@ export function buildGeodesicOwnership(mask: Uint8Array, width: number, height: 
 }
 
 /**
- * Partition the complete foreground silhouette using the bone as a directional
- * boundary, rather than deleting everything outside a fixed-width capsule.
+ * Partition the complete unmasked figure image without discarding non-joint regions.
  *
- * The projection gate keeps proximal torso pixels with the parent/root while
- * allowing an articulated part to claim its entire visible silhouette width.
- * A distance score still resolves overlaps between neighboring bones. There is
- * deliberately no distal radius cutoff: artwork is the authority on the part's
- * visible shape, while the skeleton only establishes where that shape belongs.
+ * Every single pixel belonging to the figure mask is assigned to exactly one base part,
+ * following the unmasked image contours between joints.
+ * Terminal parts (hands, feet, head top) trace the edges from the wrist/ankle joint outward
+ * to enclose all remaining extremities and details.
+ * Only areas inside joints (and their overlapping rotation sockets) are duplicated between
+ * connected parts so puppets rotate cleanly without gaps.
  */
 export function buildConstrainedOwnership(
   mask: Uint8Array,
@@ -265,23 +267,41 @@ export function buildConstrainedOwnership(
 
     for (let partIndex = 0; partIndex < segments.length; partIndex++) {
       const segment = segments[partIndex]!;
-      const projection = segmentProjection(x, y, segment.ax, segment.ay, segment.bx, segment.by);
+      const isLeaf = segment.leaf === true;
       const isRoot = partIndex === rootOwner;
-      const proximalLimit = segment.leaf === true ? -0.3 : isRoot ? -0.15 : 0.12;
-      // Keep a generous directional corridor so irregular artwork can extend
-      // beyond the nominal bone endpoint without being dropped from the part.
-      const distalLimit = 1.7;
-      if (projection < proximalLimit || projection > distalLimit) continue;
 
-      const distance = Math.sqrt(pointSegmentDistanceSquared(x, y, segment.ax, segment.ay, segment.bx, segment.by));
+      // Projection along bone vector ax->bx (0 = at joint A, 1 = at joint/target B)
+      const projection = segmentProjection(x, y, segment.ax, segment.ay, segment.bx, segment.by);
+
+      // Proximal gate: don't let child limbs steal pixels behind their parent joint
+      // For leaf parts (hands, feet), anything beyond the wrist/ankle (proj >= 0) is freely claimed.
+      const proximalLimit = isLeaf ? -0.1 : isRoot ? -0.3 : 0.05;
+      if (projection < proximalLimit) continue;
+
+      const distSq = pointSegmentDistanceSquared(x, y, segment.ax, segment.ay, segment.bx, segment.by);
+      const distance = Math.sqrt(distSq);
       const widthScale = Math.max(6, segment.radius);
-      const projectionPenalty = projection < 0 ? Math.abs(projection) * 2 : Math.max(0, projection - 1) * 1.5;
-      const score = distance / widthScale + projectionPenalty;
+
+      // Terminal leaf parts (hands, feet) extend to the absolute boundary of the silhouette
+      // without penalty for projecting past the bone tip.
+      let projectionPenalty = 0;
+      if (projection < 0) {
+        projectionPenalty = Math.abs(projection) * 2.5;
+      } else if (!isLeaf && projection > 1) {
+        projectionPenalty = (projection - 1) * 2.0;
+      }
+
+      // Bonus for leaf extremities to ensure fingers, toes, shoes, hats are securely held
+      const leafBonus = isLeaf && projection >= 0 ? 0.8 : 1.0;
+      const score = (distance / widthScale + projectionPenalty) * leafBonus;
+
       if (score < bestScore) {
         bestScore = score;
         best = partIndex;
       }
     }
+
+    // Comprehensive fallback: every unmasked pixel MUST belong to a part
     if (bestScore === Infinity) {
       let minDist = Infinity;
       for (let partIndex = 0; partIndex < segments.length; partIndex++) {
@@ -298,19 +318,63 @@ export function buildConstrainedOwnership(
   return owner;
 }
 
+export function getCurvedRadiusAtAngle(joint: Joint, angle: number): number {
+  const baseR = Math.max(8, joint.thickness) * 1.5;
+  if (!joint.radialOffsets || joint.radialOffsets.length !== 8) {
+    return baseR;
+  }
+  let a = angle;
+  if (a < 0) a += Math.PI * 2;
+  a = a % (Math.PI * 2);
+
+  const angleStep = Math.PI / 4;
+  const index1 = Math.floor(a / angleStep) % 8;
+  const index2 = (index1 + 1) % 8;
+  const t = (a - index1 * angleStep) / angleStep;
+
+  // Cosine interpolation for perfect smooth transitions between control points
+  const mu = (1 - Math.cos(t * Math.PI)) / 2;
+  const r1 = baseR * (joint.radialOffsets[index1] ?? 1.0);
+  const r2 = baseR * (joint.radialOffsets[index2] ?? 1.0);
+  return r1 * (1 - mu) + r2 * mu;
+}
+
 function overlapMask(mask: Uint8Array, width: number, height: number, joint: Joint, radius: number) {
   const result = new Uint8Array(width * height);
-  const r2 = radius * radius;
-  const minX = Math.max(0, Math.floor(joint.x - radius));
-  const maxX = Math.min(width - 1, Math.ceil(joint.x + radius));
-  const minY = Math.max(0, Math.floor(joint.y - radius));
-  const maxY = Math.min(height - 1, Math.ceil(joint.y + radius));
+  const hasRadialOffsets = joint.radialOffsets && joint.radialOffsets.length === 8;
+  const baseR = hasRadialOffsets ? Math.max(8, joint.thickness) * 1.5 : radius;
+  
+  let maxR = baseR;
+  if (hasRadialOffsets && joint.radialOffsets) {
+    for (let i = 0; i < 8; i++) {
+      const r = Math.max(8, joint.thickness) * 1.5 * (joint.radialOffsets[i] ?? 1.0);
+      if (r > maxR) maxR = r;
+    }
+  }
+
+  const minX = Math.max(0, Math.floor(joint.x - maxR));
+  const maxX = Math.min(width - 1, Math.ceil(joint.x + maxR));
+  const minY = Math.max(0, Math.floor(joint.y - maxR));
+  const maxY = Math.min(height - 1, Math.ceil(joint.y + maxR));
+
   for (let y = minY; y <= maxY; y++) {
     for (let x = minX; x <= maxX; x++) {
       if (!mask[y * width + x]) continue;
       const dx = x - joint.x;
       const dy = y - joint.y;
-      if (dx * dx + dy * dy <= r2) result[y * width + x] = 1;
+      const d = Math.hypot(dx, dy);
+
+      if (hasRadialOffsets) {
+        const angle = Math.atan2(dy, dx);
+        const allowedRadius = getCurvedRadiusAtAngle(joint, angle);
+        if (d <= allowedRadius) {
+          result[y * width + x] = 1;
+        }
+      } else {
+        if (d <= radius) {
+          result[y * width + x] = 1;
+        }
+      }
     }
   }
   return result;
@@ -433,7 +497,12 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
   const rootOwner = rootIndex >= 0 ? rootIndex : 0;
   const owner = buildConstrainedOwnership(mask, width, height, segments, rootOwner);
   const overlaps = new Map<string, Uint8Array>();
-  for (const joint of joints) overlaps.set(joint.id, overlapMask(mask, width, height, joint, Math.max(12, joint.thickness * 1.6)));
+  for (const joint of joints) {
+    // Only duplicate the circular socket area inside the joint itself
+    // Radius matches joint thickness (socket radius)
+    const socketRadius = Math.max(8, joint.thickness * 1.15);
+    overlaps.set(joint.id, overlapMask(mask, width, height, joint, socketRadius));
+  }
 
   const parts: CutPart[] = [];
   for (let partIndex = 0; partIndex < segments.length; partIndex++) {
@@ -442,17 +511,25 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
     const overlap = overlaps.get(joint.id) ?? new Uint8Array(width * height);
     const boundsOverlap = new Uint8Array(width * height);
     const kids = childrenOf(joint.id, joints);
-    for (let i = 0; i < boundsOverlap.length; i++) if (overlap[i]) boundsOverlap[i] = 1;
+
+    // Duplicate ONLY within the joint sockets connecting this part to its parent and immediate children
+    for (let i = 0; i < boundsOverlap.length; i++) {
+      if (overlap[i]) boundsOverlap[i] = 1;
+    }
     for (const child of kids) {
       const childOverlap = overlaps.get(child.id);
       if (!childOverlap) continue;
-      for (let i = 0; i < boundsOverlap.length; i++) if (childOverlap[i]) boundsOverlap[i] = 1;
+      for (let i = 0; i < boundsOverlap.length; i++) {
+        if (childOverlap[i]) boundsOverlap[i] = 1;
+      }
     }
     if (segment.isHip && segment.legStarts) {
       for (const leg of segment.legStarts) {
         const legOverlap = overlaps.get(leg.id);
         if (!legOverlap) continue;
-        for (let i = 0; i < boundsOverlap.length; i++) if (legOverlap[i]) boundsOverlap[i] = 1;
+        for (let i = 0; i < boundsOverlap.length; i++) {
+          if (legOverlap[i]) boundsOverlap[i] = 1;
+        }
       }
     }
     const bounds = boundsForPart(owner, mask, boundsOverlap, partIndex, width, height);
@@ -471,55 +548,33 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
           const sx = cropMinX + x;
           const sy = cropMinY + y;
           const srcIndex = sy * width + sx;
+
+          // Only unmasked image pixels are included
+          if (!mask[srcIndex]) continue;
+
+          // Pixel is part of this segment if it is owned by this part
           const isOwned = owner[srcIndex] === partIndex;
-          let isOverlap = overlap[srcIndex] === 1;
-          if (!isOverlap) {
+
+          // Or if it falls within the duplicated joint socket zone (proximal socket at joint, or distal child socket)
+          let isJointSocketOverlap = overlap[srcIndex] === 1;
+          if (!isJointSocketOverlap) {
             for (const child of kids) {
               if ((overlaps.get(child.id)?.[srcIndex] ?? 0) === 1) {
-                isOverlap = true;
+                isJointSocketOverlap = true;
                 break;
               }
             }
           }
-
-          // Initial part geometric guarantee:
-          // 1. Joint circle itself (socket circle)
-          const dJointCenterSq = (sx - joint.x) ** 2 + (sy - joint.y) ** 2;
-          const jointR = joint.thickness;
-          const inJointCircle = dJointCenterSq <= jointR * jointR;
-
-          // 2. Joints filled with curved lines between them (smooth capsule / corridor)
-          let inCurvedBridge = false;
-          if (!segment.leaf && (segment.ax !== segment.bx || segment.ay !== segment.by)) {
-            const dLineSq = pointSegmentDistanceSquared(sx, sy, segment.ax, segment.ay, segment.bx, segment.by);
-            const rBridge = segment.radius;
-            if (dLineSq <= rBridge * rBridge) {
-              inCurvedBridge = true;
-            }
-          }
-
-          // 3. For hip: must contain hip circle and both leg start circles, plus curved connection
-          let inHipStructure = false;
-          if (segment.isHip && segment.legStarts) {
+          if (!isJointSocketOverlap && segment.isHip && segment.legStarts) {
             for (const leg of segment.legStarts) {
-              const dLegSq = (sx - leg.x) ** 2 + (sy - leg.y) ** 2;
-              if (dLegSq <= leg.thickness * leg.thickness) {
-                inHipStructure = true;
-                break;
-              }
-              const dHipLegSq = pointSegmentDistanceSquared(sx, sy, joint.x, joint.y, leg.x, leg.y);
-              const rAvg = (joint.thickness + leg.thickness) * 0.55;
-              if (dHipLegSq <= rAvg * rAvg) {
-                inHipStructure = true;
+              if ((overlaps.get(leg.id)?.[srcIndex] ?? 0) === 1) {
+                isJointSocketOverlap = true;
                 break;
               }
             }
           }
 
-          if (
-            mask[srcIndex] &&
-            (isOwned || isOverlap || inJointCircle || inCurvedBridge || inHipStructure)
-          ) {
+          if (isOwned || isJointSocketOverlap) {
             alpha[y * cw + x] = 255;
           }
         }
