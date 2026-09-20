@@ -281,6 +281,35 @@ function maskToCanvas(alpha: Uint8Array, width: number, height: number) {
   return canvas;
 }
 
+function renderAttachmentRaw(
+  image: ImageData,
+  cropMinX: number,
+  cropMinY: number,
+  cw: number,
+  ch: number,
+) {
+  const canvas = document.createElement("canvas");
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas is unavailable");
+  const out = ctx.createImageData(cw, ch);
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      const sx = cropMinX + x;
+      const sy = cropMinY + y;
+      const src = (sy * image.width + sx) * 4;
+      const dst = (y * cw + x) * 4;
+      out.data[dst] = image.data[src] ?? 0;
+      out.data[dst + 1] = image.data[src + 1] ?? 0;
+      out.data[dst + 2] = image.data[src + 2] ?? 0;
+      out.data[dst + 3] = image.data[src + 3] ?? 0; // Raw alpha
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+  return canvas;
+}
+
 function renderAttachmentFromMask(
   image: ImageData,
   cropMinX: number,
@@ -438,6 +467,7 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
     if (pixelCount < 1 || cw < 1 || ch < 1) continue;
     
     const alphaCanvas = maskToCanvas(alpha, cw, ch);
+    const rawCanvas = renderAttachmentRaw(image, cropMinX, cropMinY, cw, ch);
 
     parts.push({
       id: joint.id,
@@ -446,6 +476,7 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
       parentBoneId: joint.parentId,
       role: "main",
       dataUrl: rgbCanvas.toDataURL("image/png"),
+      baseDataUrl: rawCanvas.toDataURL("image/png"),
       width: cw,
       height: ch,
       cropX: cropMinX,
@@ -467,6 +498,7 @@ export async function cutParts(sourceDataUrl: string, joints: Joint[], bg: Backg
         alphaPngDataUrl: alphaCanvas.toDataURL("image/png"),
         source: "auto",
         confidence: estimatePartConfidence(joint, pixelCount, cw, ch, joint.thickness),
+        pixelMask: new Uint8Array(alpha),
       },
       sourceVersion: 0,
       repaired: false,

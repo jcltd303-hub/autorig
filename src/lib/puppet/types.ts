@@ -48,6 +48,7 @@ export type Attachment = {
   parentBoneId: string | null;
   role: AttachmentRole;
   dataUrl: string;
+  baseDataUrl: string;
   width: number;
   height: number;
   cropX: number;

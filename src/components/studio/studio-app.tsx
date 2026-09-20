@@ -10,6 +10,8 @@ import {
   Sparkles,
   Trash2,
   Wand2,
+  Paintbrush,
+  Ghost,
 } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -85,6 +87,17 @@ export function StudioApp() {
   const loadFile = useStudio((s) => s.loadFile);
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiModalTab, setAiModalTab] = useState<"create" | "edit">("create");
+
+  const [windowSize, setWindowSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    const onResize = () => {
+      setWindowSize({ width: window.innerWidth, height: window.innerHeight });
+    };
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -315,16 +328,19 @@ function Workbench() {
   const step = useStudio((s) => s.step);
   const attachments = useStudio((s) => s.attachments);
   return (
-    <div className="grid h-full min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(18rem,_1fr)_auto] lg:grid-cols-[1fr_20rem] lg:grid-rows-1">
-      <section className="flex min-h-0 flex-col gap-3 p-3 md:p-4">
-        <div className="min-h-0 flex-1">
+    <div className="grid h-full min-h-0 flex-1 grid-cols-[auto_1fr_auto] p-4 gap-4 overflow-auto">
+      <aside className="flex flex-col gap-2">
+        {step === "bones" ? <BonesInspectorSidebar /> : null}
+      </aside>
+      <section className="flex min-h-0 flex-col gap-3 overflow-auto">
+        <div className="min-h-0 flex-1 rounded-xl bg-surface border border-border">
           <StageCanvas mode={step === "bones" ? "bones" : "puppet"} />
         </div>
         {step === "parts" || step === "archive" ? <PartTiles attachments={attachments} /> : null}
         {step === "motion" ? <Timeline /> : null}
       </section>
-      <aside className="h-inspector border-t border-border lg:border-t-0 lg:border-l">
-        <ScrollArea className="h-full">
+      <aside className="h-full w-80">
+        <ScrollArea className="h-full rounded-xl border border-border bg-surface">
           <div className="flex flex-col gap-5 p-4">
             {step === "bones" ? <BonesInspector /> : null}
             {step === "parts" ? <PartsInspector /> : null}
@@ -334,6 +350,37 @@ function Workbench() {
         </ScrollArea>
       </aside>
     </div>
+  );
+}
+
+function BonesInspectorSidebar() {
+  const pinMode = useStudio((s) => s.pinMode);
+  return (
+      <div className="flex flex-col gap-2">
+        <Button 
+          variant="outline" 
+          className="size-11 p-0 flex items-center justify-center" 
+          onClick={() => useStudio.getState().setPinMode(pinMode === "pin" ? "adjust" : "pin")}
+          title={pinMode === "pin" ? "Done pinning" : "Place bones"}
+        >
+          <Pin className="size-5" />
+        </Button>
+        <Button 
+          variant="outline" 
+          className="size-11 p-0 flex items-center justify-center" 
+          onClick={() => void useStudio.getState().autoPin()}
+          title="Auto-pin"
+        >
+          <RotateCcw className="size-5" />
+        </Button>
+        <Button 
+          className="size-11 p-0 flex items-center justify-center" 
+          onClick={() => void useStudio.getState().askGrokToPin()}
+          title="Ask Gemini to pin"
+        >
+          <Wand2 className="size-5" />
+        </Button>
+      </div>
   );
 }
 
@@ -364,28 +411,15 @@ function BonesInspector() {
               type="button"
               onClick={() => useStudio.getState().setKind(k)}
               className={cn(
-                "h-9 rounded-full px-3 text-xs",
+                "size-11 rounded-lg flex items-center justify-center text-xs",
                 k === kind ? "bg-accent text-accent-fg" : "bg-elevated text-muted",
               )}
+              title={KIND_LABEL[k]}
             >
-              {KIND_LABEL[k]}
+              {KIND_LABEL[k].slice(0, 2)}
             </button>
           ))}
         </div>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <Button variant="outline" onClick={() => useStudio.getState().setPinMode(pinMode === "pin" ? "adjust" : "pin")}>
-          <Pin />
-          {pinMode === "pin" ? "Done pinning" : "Place bones"}
-        </Button>
-        <Button variant="outline" onClick={() => void useStudio.getState().autoPin()}>
-          <RotateCcw />
-          Auto-pin
-        </Button>
-        <Button className="col-span-2" onClick={() => void useStudio.getState().askGrokToPin()}>
-          <Wand2 />
-          Ask Gemini to pin
-        </Button>
       </div>
 
       <div className="rounded-lg border border-border bg-elevated/40 p-3 space-y-2.5">
@@ -430,12 +464,12 @@ function BonesInspector() {
           />
           <Button
             size="sm"
-            className="h-8 shrink-0 text-xs gap-1"
+            className="size-8 shrink-0 p-0 flex items-center justify-center"
             disabled={!useStudio((s) => s.editPrompt).trim()}
             onClick={() => void useStudio.getState().editImage()}
+            title="Edit Figure"
           >
-            <Wand2 className="size-3.5" />
-            Edit
+            <Wand2 className="size-4" />
           </Button>
         </div>
       </div>
@@ -594,17 +628,20 @@ function PartsInspector() {
                   <div className="w-full truncate text-center">
                     <span className="block truncate text-xs font-medium text-fg">{part.label}</span>
                     <span className="text-[10px] text-muted">{part.width}×{part.height}px</span>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="w-full mt-1 text-[10px] h-6"
+                    <div
+                      className={cn(
+                        "inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors border border-input bg-background shadow-sm hover:bg-accent hover:text-accent-fg",
+                        "size-8 mt-1 cursor-pointer flex items-center justify-center"
+                      )}
                       onClick={(e) => {
                         e.stopPropagation();
                         useStudio.getState().setBrush({ enabled: true, attachmentId: part.id });
                       }}
+                      role="button"
+                      title="Edit Mask"
                     >
-                      Edit Mask
-                    </Button>
+                      <Paintbrush className="size-4" />
+                    </div>
                   </div>
                 </button>
               );
@@ -701,10 +738,20 @@ function Timeline() {
   const time = useStudio((s) => s.time);
   const animations = useStudio((s) => s.animations);
   const active = useStudio((s) => s.activeAnimId);
+  const onionSkinning = useStudio((s) => s.onionSkinning);
   const anim = animations.find((a) => a.id === active);
   if (!anim) return null;
   return (
     <div className="flex items-center gap-3 rounded-lg bg-surface px-3 py-2 shadow-border">
+      <Button
+        variant={onionSkinning ? "default" : "ghost"}
+        size="icon"
+        className="size-8"
+        onClick={() => useStudio.getState().toggleOnionSkinning()}
+        title="Toggle onion skinning"
+      >
+        <Ghost className="size-4" />
+      </Button>
       <span className="font-mono text-xs tabular-nums text-muted">
         {time.toFixed(2)} / {anim.duration.toFixed(2)}s
       </span>

@@ -41,6 +41,7 @@ type StudioState = {
   partDraftVersion: number;
   jointVersion: number;
   brush: BrushState;
+  onionSkinning: boolean;
   animations: AnimationDef[];
   activeAnimId: string | null;
   playing: boolean;
@@ -79,8 +80,16 @@ type StudioState = {
   setPlaying: (playing: boolean) => void;
   setTime: (time: number) => void;
   setSpeed: (speed: number) => void;
+  toggleOnionSkinning: () => void;
   setBrush: (brush: Partial<BrushState>) => void;
-  updateAttachmentMask: (attachmentId: string, newMask: PartMask) => void;
+  updateAttachmentMask: (attachmentId: string, newMask: PartMask | Uint8Array) => void;
+  saveAttachmentCut: (
+    attachmentId: string,
+    maskArray: Uint8Array,
+    cutDataUrl: string,
+    alphaPngDataUrl: string,
+    pixelCount: number,
+  ) => void;
   setAttachmentsNeedReview: (need: boolean) => void;
   toggleSweep: (id: string | null) => void;
   currentAngles: () => Record<string, number>;
@@ -130,6 +139,7 @@ export const useStudio = create<StudioState>((set, get) => ({
     enabled: false,
     attachmentId: null,
   },
+  onionSkinning: false,
   animations: [],
   activeAnimId: null,
   playing: false,
@@ -263,10 +273,6 @@ export const useStudio = create<StudioState>((set, get) => ({
       const dataUrl = canvas.toDataURL("image/png");
       await get().loadDataUrl(dataUrl, name, kind);
       const state = get();
-      if (state.source && state.joints.length) {
-        await state.cutPaper();
-        get().playPreset("wave");
-      }
     } catch (err) {
       set({ busy: null, error: err instanceof Error ? err.message : "Could not open the example" });
     }
@@ -509,13 +515,46 @@ export const useStudio = create<StudioState>((set, get) => ({
   setPlaying: (playing) => set({ playing }),
   setTime: (time) => set({ time }),
   setSpeed: (speed) => set({ speed }),
+  toggleOnionSkinning: () => set((s) => ({ onionSkinning: !s.onionSkinning })),
   setBrush: (brush) => set((s) => ({ brush: { ...s.brush, ...brush } })),
-  updateAttachmentMask: (attachmentId, newMask) =>
+  updateAttachmentMask: (attachmentId, newMask) => {
     set((s) => ({
-      attachments: s.attachments.map((a) =>
-        a.id === attachmentId ? { ...a, mask: newMask, repaired: true, sourceVersion: a.sourceVersion + 1 } : a
-      ),
-    })),
+      attachments: s.attachments.map((a) => {
+        if (a.id !== attachmentId) return a;
+        const isPartMask = typeof newMask === "object" && newMask !== null && "bboxX" in newMask;
+        const updatedMask: PartMask = isPartMask
+          ? (newMask as PartMask)
+          : { ...a.mask, pixelMask: newMask as Uint8Array };
+        return {
+          ...a,
+          mask: updatedMask,
+          repaired: true,
+          sourceVersion: a.sourceVersion + 1,
+        };
+      }),
+    }));
+  },
+  saveAttachmentCut: (attachmentId, maskArray, cutDataUrl, alphaPngDataUrl, pixelCount) => {
+    set((s) => ({
+      attachments: s.attachments.map((a) => {
+        if (a.id !== attachmentId) return a;
+        return {
+          ...a,
+          dataUrl: cutDataUrl,
+          pixelCount,
+          repaired: true,
+          sourceVersion: a.sourceVersion + 1,
+          mask: {
+            ...a.mask,
+            alphaPngDataUrl,
+            pixelMask: new Uint8Array(maskArray),
+            source: "edited",
+          },
+        };
+      }),
+      attachmentsNeedReview: false,
+    }));
+  },
   setAttachmentsNeedReview: (need) => set({ attachmentsNeedReview: need }),
   toggleSweep: (id) => set({ sweepId: get().sweepId === id ? null : id, playing: false }),
   currentAngles: () => {

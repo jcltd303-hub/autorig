@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { contain, loadHtmlImage } from "@/lib/puppet/image";
 import { useStudio } from "@/lib/puppet/store";
+import { anglesAt } from "@/lib/puppet/animate";
 import type { Attachment, Joint } from "@/lib/puppet/types";
 import { cn } from "@/lib/utils";
 
@@ -109,6 +110,34 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
             const t = (performance.now() / 1400) % 2;
             const u = t < 1 ? t : 2 - t;
             angles[joint.id] = joint.minAngle + (joint.maxAngle - joint.minAngle) * u;
+          }
+        }
+
+        if (state.onionSkinning && state.activeAnimId && mode === "puppet") {
+          const anim = state.animations.find((a) => a.id === state.activeAnimId);
+          if (anim) {
+            const prevTime = Math.max(0, state.time - 0.1);
+            const nextTime = Math.min(anim.duration, state.time + 0.1);
+            const prevAngles = anglesAt(state.joints, anim, prevTime);
+            const nextAngles = anglesAt(state.joints, anim, nextTime);
+            const byId = new Map(state.joints.map((j) => [j.id, j]));
+            const ordered = [...state.attachments].sort((a, b) => a.zIndex - b.zIndex);
+            ctx.globalAlpha = 0.2;
+            for (const angles of [prevAngles, nextAngles]) {
+              for (const attachment of ordered) {
+                const joint = byId.get(attachment.boneId);
+                if (!joint) continue;
+                try {
+                  const img = await cached(attachment.dataUrl);
+                  if (dead) return;
+                  ctx.save();
+                  applyChain(ctx, joint, byId, angles);
+                  ctx.drawImage(img, attachment.cropX, attachment.cropY);
+                  ctx.restore();
+                } catch { /* skip */ }
+              }
+            }
+            ctx.globalAlpha = 1.0;
           }
         }
 
