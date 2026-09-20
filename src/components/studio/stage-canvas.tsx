@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { contain, loadHtmlImage } from "@/lib/puppet/image";
+import { contain, loadHtmlImage, buildFigureMask, readImageData } from "@/lib/puppet/image";
 import { useStudio } from "@/lib/puppet/store";
 import { anglesAt } from "@/lib/puppet/animate";
-import type { Attachment, Joint } from "@/lib/puppet/types";
+import { buildSkinRig, renderSkinnedFrame, type SkinRig } from "@/lib/puppet/skin-render";
+import type { Attachment, BackgroundKey, Joint } from "@/lib/puppet/types";
 import { cn } from "@/lib/utils";
 import { Paintbrush } from "lucide-react";
 
@@ -22,6 +23,28 @@ async function cached(src: string) {
   const img = await loadHtmlImage(src);
   imageCache.set(src, img);
   return img;
+}
+
+// Cache for the pixel-bend skinning rig: rebuilding it (silhouette + bone ownership) is
+// too expensive to redo every animation frame, so it's only recomputed when the source
+// image or the joint layout actually changes.
+let skinRigEntry: { key: string; rig: SkinRig; sourceImageData: ImageData } | null = null;
+let skinCanvas: HTMLCanvasElement | null = null;
+
+async function ensureSkinRig(
+  source: { dataUrl: string; width: number; height: number },
+  bg: BackgroundKey | null,
+  joints: Joint[],
+  jointVersion: number,
+) {
+  const key = `${source.dataUrl}|${jointVersion}|${joints.length}`;
+  if (skinRigEntry && skinRigEntry.key === key) return skinRigEntry;
+  const img = await cached(source.dataUrl);
+  const sourceImageData = readImageData(img);
+  const mask = buildFigureMask(sourceImageData, bg ?? { r: 0, g: 0, b: 0, threshold: 0, lift: false });
+  const rig = buildSkinRig(mask, source.width, source.height, joints);
+  skinRigEntry = { key, rig, sourceImageData };
+  return skinRigEntry;
 }
 
 function chainOf(joint: Joint, byId: Map<string, Joint>) {
@@ -71,16 +94,19 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
   const selectedId = useStudio((s) => s.selectedId);
   const pinMode = useStudio((s) => s.pinMode);
   const pinIndex = useStudio((s) => s.pinIndex);
+  const pinHandleAngle = useStudio((s) => s.pinHandleAngle);
   const attachments = useStudio((s) => s.attachments);
   const setSelected = useStudio((s) => s.setSelected);
   const moveJoint = useStudio((s) => s.moveJoint);
   const updateJoint = useStudio((s) => s.updateJoint);
   const placeNextPin = useStudio((s) => s.placeNextPin);
+  const setPinHandleAngle = useStudio((s) => s.setPinHandleAngle);
   const fitRef = useRef({ x: 0, y: 0, w: 0, h: 0, s: 1 });
   const dragRef = useRef<
     | { type: "move"; jointId: string }
     | { type: "resize"; jointId: string; centerX: number; centerY: number }
     | { type: "radialOffset"; jointId: string; pointIndex: number; centerX: number; centerY: number }
+    | { type: "pinAngle"; jointId: string }
     | null
   >(null);
   const [canvasCursor, setCanvasCursor] = useState<string>("default");
@@ -173,34 +199,67 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
             state.pinMode === "pin" ? (state.joints[state.pinIndex]?.id ?? null) : null,
             activeResizeId,
           );
+          if (mode === "bones" && state.selectedId) {
+            const sel = state.joints.find((j) => j.id === state.selectedId);
+            if (sel) {
+              drawRotationHandle(ctx, sel, state.pinHandleAngle, dragRef.current?.type === "pinAngle");
+            }
+          }
         } else {
           const byId = new Map(state.joints.map((j) => [j.id, j]));
           const ordered = [...state.attachments].sort((a, b) => a.zIndex - b.zIndex);
-          for (const attachment of ordered) {
-            const joint = byId.get(attachment.boneId);
-            if (!joint) continue;
+
+          if (state.pixelBend) {
             try {
-              const img = await cached(attachment.dataUrl);
-              if (dead) return;
+              const { rig, sourceImageData } = await ensureSkinRig(state.source!, state.bg, state.joints, state.jointVersion);
+              const warped = renderSkinnedFrame(sourceImageData, rig, state.joints, angles);
+              if (!skinCanvas || skinCanvas.width !== warped.width || skinCanvas.height !== warped.height) {
+                skinCanvas = document.createElement("canvas");
+                skinCanvas.width = warped.width;
+                skinCanvas.height = warped.height;
+              }
+              const sctx = skinCanvas.getContext("2d");
+              if (sctx) {
+                sctx.putImageData(warped, 0, 0);
+                ctx.drawImage(skinCanvas, 0, 0);
+              }
+            } catch {
+              /* rig not ready yet (e.g. mid-rebuild) — skip this frame's puppet draw */
+            }
+          } else {
+            for (const attachment of ordered) {
+              const joint = byId.get(attachment.boneId);
+              if (!joint) continue;
+              try {
+                const img = await cached(attachment.dataUrl);
+                if (dead) return;
+                ctx.save();
+                applyChain(ctx, joint, byId, angles);
+                ctx.drawImage(img, attachment.cropX, attachment.cropY);
+                ctx.restore();
+              } catch {
+                /* skip */
+              }
+            }
+          }
+
+          if (state.step === "parts" && state.selectedId) {
+            const joint = byId.get(state.selectedId);
+            if (joint) {
               ctx.save();
               applyChain(ctx, joint, byId, angles);
-              ctx.drawImage(img, attachment.cropX, attachment.cropY);
-              if (state.step === "parts" && state.selectedId === attachment.boneId) {
-                drawRotationCrosshair(
-                  ctx,
-                  joint.x,
-                  joint.y,
-                  joint.thickness,
-                  true,
-                  false,
-                  activeResizeId === joint.id,
-                  joint.label,
-                  joint,
-                );
-              }
+              drawRotationCrosshair(
+                ctx,
+                joint.x,
+                joint.y,
+                joint.thickness,
+                true,
+                false,
+                activeResizeId === joint.id,
+                joint.label,
+                joint,
+              );
               ctx.restore();
-            } catch {
-              /* skip */
             }
           }
         }
@@ -290,6 +349,20 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
     return null;
   }
 
+  function hitPinHandle(x: number, y: number): Joint | null {
+    if (!selectedId) return null;
+    const sel = joints.find((j) => j.id === selectedId);
+    if (!sel) return null;
+    const fit = fitRef.current;
+    const s = fit.s || 1;
+    const rad = (pinHandleAngle * Math.PI) / 180;
+    const len = Math.max(34, sel.thickness * 2.2);
+    const hx = sel.x + len * Math.sin(rad);
+    const hy = sel.y - len * Math.cos(rad);
+    const d = Math.hypot(hx - x, hy - y);
+    return d <= 14 / s ? sel : null;
+  }
+
   return (
     <div ref={wrapRef} className="relative h-full min-h-72 w-full overflow-hidden rounded-lg bg-surface">
       <canvas
@@ -301,6 +374,15 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
           const p = imagePoint(e);
           if (!p) return;
           (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+
+          // 0. The rotation-range handle on the selected joint takes priority over
+          // placing/moving pins, so it can be aimed right after (or well after) a pin drop.
+          const handleJoint = hitPinHandle(p.x, p.y);
+          if (handleJoint) {
+            dragRef.current = { type: "pinAngle", jointId: handleJoint.id };
+            return;
+          }
+
           if (pinMode === "pin") {
             placeNextPin(p.x, p.y);
             return;
@@ -385,6 +467,16 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
                 currentOffsets[idx] = Number(mult.toFixed(3));
                 updateJoint(jointId, { radialOffsets: currentOffsets });
               }
+            } else if (dragRef.current.type === "pinAngle") {
+              const joint = joints.find((j) => j.id === dragRef.current!.jointId);
+              if (joint) {
+                const dx = p.x - joint.x;
+                const dy = p.y - joint.y;
+                let deg = (Math.atan2(dx, -dy) * 180) / Math.PI;
+                if (deg > 180) deg -= 360;
+                if (deg < -180) deg += 360;
+                setPinHandleAngle(Math.round(deg));
+              }
             }
             return;
           }
@@ -414,6 +506,8 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
 
             if (hoverRadial) {
               setCanvasCursor("pointer");
+            } else if (hitPinHandle(p.x, p.y)) {
+              setCanvasCursor("grab");
             } else {
               const hit = hitJoint(p.x, p.y);
               if (hit) {
@@ -433,6 +527,56 @@ export function StageCanvas({ mode }: { mode: "bones" | "puppet" }) {
       />
     </div>
   );
+}
+
+function drawRotationHandle(
+  ctx: CanvasRenderingContext2D,
+  joint: Joint,
+  angleDeg: number,
+  dragging: boolean,
+) {
+  const rad = (angleDeg * Math.PI) / 180;
+  const len = Math.max(34, joint.thickness * 2.2);
+  const hx = joint.x + len * Math.sin(rad);
+  const hy = joint.y - len * Math.cos(rad);
+
+  ctx.save();
+
+  // Stop-range arc: shows how far minAngle..maxAngle currently sweeps from rest (up).
+  const r = len * 0.62;
+  ctx.beginPath();
+  ctx.arc(joint.x, joint.y, r, -Math.PI / 2 + (joint.minAngle * Math.PI) / 180, -Math.PI / 2 + (joint.maxAngle * Math.PI) / 180);
+  ctx.strokeStyle = "rgba(124, 255, 178, 0.45)";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([]);
+  ctx.stroke();
+
+  // Handle arm
+  ctx.beginPath();
+  ctx.moveTo(joint.x, joint.y);
+  ctx.lineTo(hx, hy);
+  ctx.strokeStyle = dragging ? "#ffc53d" : "#7CFFB2";
+  ctx.lineWidth = dragging ? 2.5 : 1.6;
+  ctx.stroke();
+
+  // Handle tip
+  ctx.beginPath();
+  ctx.arc(hx, hy, dragging ? 7 : 5.5, 0, Math.PI * 2);
+  ctx.fillStyle = dragging ? "#ffc53d" : "#7CFFB2";
+  ctx.fill();
+  ctx.strokeStyle = "#0d0c0b";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+
+  ctx.font = "600 11px Outfit, sans-serif";
+  ctx.fillStyle = dragging ? "#ffc53d" : "#7CFFB2";
+  ctx.strokeStyle = "rgba(13,12,11,0.9)";
+  ctx.lineWidth = 3;
+  const label = `${Math.round(angleDeg)}° — drag to aim, then Set Min/Max`;
+  ctx.strokeText(label, hx + 8, hy - 6);
+  ctx.fillText(label, hx + 8, hy - 6);
+
+  ctx.restore();
 }
 
 function drawRotationCrosshair(

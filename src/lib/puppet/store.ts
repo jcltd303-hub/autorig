@@ -36,6 +36,8 @@ type StudioState = {
   selectedId: string | null;
   pinMode: PinMode;
   pinIndex: number;
+  pinHandleAngle: number;
+  pixelBend: boolean;
   attachments: Attachment[];
   attachmentsNeedReview: boolean;
   partDraftVersion: number;
@@ -61,6 +63,9 @@ type StudioState = {
   setMotionPrompt: (v: string) => void;
   setSelected: (id: string | null) => void;
   setPinMode: (mode: PinMode) => void;
+  setPinHandleAngle: (angle: number) => void;
+  commitPinAngle: (which: "min" | "max") => void;
+  togglePixelBend: () => void;
   moveJoint: (id: string, x: number, y: number) => void;
   updateJoint: (id: string, patch: Partial<Joint>) => void;
   deleteJoint: (id: string) => void;
@@ -128,6 +133,8 @@ export const useStudio = create<StudioState>((set, get) => ({
   selectedId: null,
   pinMode: "adjust",
   pinIndex: 0,
+  pinHandleAngle: 0,
+  pixelBend: false,
   attachments: [],
   attachmentsNeedReview: false,
   partDraftVersion: 0,
@@ -188,7 +195,16 @@ export const useStudio = create<StudioState>((set, get) => ({
   setEditPrompt: (v) => set({ editPrompt: v }),
   setMotionPrompt: (v) => set({ motionPrompt: v }),
   setSelected: (id) => set({ selectedId: id }),
-  setPinMode: (mode) => set({ pinMode: mode, pinIndex: 0 }),
+  setPinMode: (mode) => set({ pinMode: mode, pinIndex: 0, pinHandleAngle: 0 }),
+  setPinHandleAngle: (angle) => set({ pinHandleAngle: angle }),
+  commitPinAngle: (which) => {
+    const { joints, pinIndex, pinMode, selectedId, pinHandleAngle } = get();
+    const targetId = pinMode === "pin" ? (joints[pinIndex]?.id ?? selectedId) : selectedId;
+    if (!targetId) return;
+    const angle = Math.max(-180, Math.min(180, Math.round(pinHandleAngle)));
+    get().updateJoint(targetId, which === "min" ? { minAngle: angle } : { maxAngle: angle });
+  },
+  togglePixelBend: () => set((s) => ({ pixelBend: !s.pixelBend })),
   moveJoint: (id, x, y) => {
     const { source } = get();
     if (!source) return;
@@ -255,6 +271,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         busy: null,
         pinMode: "adjust",
         pinIndex: 0,
+        pinHandleAngle: 0,
       });
     } catch (err) {
       set({ busy: null, error: err instanceof Error ? err.message : "Could not load the figure" });
@@ -407,6 +424,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       pinIndex: next,
       selectedId: joint.id,
       pinMode: next >= joints.length ? "adjust" : "pin",
+      pinHandleAngle: 0,
     });
   },
   cutPaper: async () => {
