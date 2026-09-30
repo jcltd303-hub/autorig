@@ -15,6 +15,7 @@ import {
   Crosshair,
   Eye,
   Sliders,
+  Waves,
 } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -656,6 +657,8 @@ function BonesInspector({ onSwitchToStage }: { onSwitchToStage?: () => void }) {
 function JointFields({ joint, onSwitchToStage }: { joint: Joint; onSwitchToStage?: () => void }) {
   const j = useStudio((s) => s.joints.find((x) => x.id === joint.id));
   const update = useStudio((s) => s.updateJoint);
+  const pinHandleAngle = useStudio((s) => s.pinHandleAngle);
+  const commitPinAngle = useStudio((s) => s.commitPinAngle);
   if (!j) return null;
   return (
     <div className="space-y-3 rounded-lg bg-elevated p-3 shadow-border">
@@ -689,6 +692,20 @@ function JointFields({ joint, onSwitchToStage }: { joint: Joint; onSwitchToStage
           >
             <Trash2 className="size-3.5" />
           </button>
+        </div>
+      </div>
+      <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-surface/60 px-2.5 py-2">
+        <div className="text-xs text-muted">
+          Rotation handle: <span className="font-mono text-fg">{Math.round(pinHandleAngle)}°</span>
+          <span className="block text-[10px] text-subtle">Drag the green handle on stage to aim it</span>
+        </div>
+        <div className="flex gap-1.5 shrink-0">
+          <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => commitPinAngle("min")}>
+            Set Min
+          </Button>
+          <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => commitPinAngle("max")}>
+            Set Max
+          </Button>
         </div>
       </div>
       <Field label="Min angle" value={j.minAngle} min={-180} max={180} onChange={(v) => update(j.id, { minAngle: v })} />
@@ -933,10 +950,20 @@ function Timeline() {
   const animations = useStudio((s) => s.animations);
   const active = useStudio((s) => s.activeAnimId);
   const onionSkinning = useStudio((s) => s.onionSkinning);
+  const pixelBend = useStudio((s) => s.pixelBend);
   const anim = animations.find((a) => a.id === active);
   if (!anim) return null;
   return (
     <div className="flex items-center gap-3 rounded-lg bg-surface px-3 py-2 shadow-border">
+      <Button
+        variant={pixelBend ? "default" : "ghost"}
+        size="icon"
+        className="size-8"
+        onClick={() => useStudio.getState().togglePixelBend()}
+        title="Bend pixels smoothly at joints instead of rotating rigid cutouts (experimental)"
+      >
+        <Waves className="size-4" />
+      </Button>
       <Button
         variant={onionSkinning ? "default" : "ghost"}
         size="icon"
